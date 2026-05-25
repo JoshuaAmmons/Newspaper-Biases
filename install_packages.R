@@ -20,6 +20,9 @@ cran <- c(
   "fect",              # interactive fixed effects / matrix completion
   # geography / maps
   "usmap", "sf",
+  # text features + Random Forest measurement (validated lexicon/RF path, from the
+  # american-stories-incivility repo: TF-IDF/SVD features + ranger RF + ROC/calibration)
+  "quanteda", "irlba", "ranger", "pROC",
   # misc
   "remotes"
 )

@@ -1,0 +1,73 @@
+---
+title: "06a — Baseline: lexicon scoring (validated RF path)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(parallel)
+```
+
+Scores every cleaned article against the four `BIAS_SEED_LEXICONS` (matches per 1000
+words) → per-bias `*_lex` columns. This is the validated lexicon layer from
+`american-stories-incivility` (`03_build_lexicon`), generalized to the four biases. The
+lexicon score is the **candidate selector** (rmd/04 sampling), the **RF pseudo-label
+source** (06c), and a **baseline measure** — never the final bias measure. Parallelized
+across years with a PSOCK cluster.
+
+```{r score}
+cleaned_dir <- file.path(DATA_PARQUET, "articles_cleaned")
+out_dir     <- file.path(DATA_PARQUET, "articles_lexscored")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+year_dirs <- list.files(cleaned_dir, pattern = "^year=\\d{4}$", full.names = TRUE)
+stopifnot(length(year_dirs) > 0)
+message("years to score: ", length(year_dirs))
+
+score_year <- function(yd) {
+  yr  <- as.integer(sub(".*year=(\\d{4}).*", "\\1", yd))
+  out <- file.path(out_dir, paste0("lexscored_", yr, ".parquet"))
+  if (file.exists(out)) return(paste0(yr, ": exists"))
+  pf <- list.files(yd, pattern = "\\.parquet$", full.names = TRUE)[1]
+  dt <- as.data.table(arrow::read_parquet(
+    pf, col_select = c("article_id","newspaper_name","lccn","date","page","year","article")))
+  for (b in names(BIAS_SEED_LEXICONS)) {
+    dt[[paste0(b, "_lex")]] <- lexicon_score(dt$article, BIAS_SEED_LEXICONS[[b]])
+  }
+  dt[, article := NULL]   # drop text; keep ids/meta + lexicon scores
+  tmp <- paste0(out, ".tmp")
+  arrow::write_parquet(dt, tmp); file.rename(tmp, out)
+  paste0(yr, ": ", nrow(dt), " scored")
+}
+
+# Cap workers to bound RAM (each loads one year's text transiently).
+ncores <- min(parallel::detectCores() - 2L, 12L)
+cl <- makeCluster(min(ncores, length(year_dirs)))
+clusterEvalQ(cl, { library(arrow); library(data.table); library(stringi) })
+clusterExport(cl, c("BIAS_SEED_LEXICONS", "lexicon_score", "out_dir"), envir = environment())
+res <- parLapply(cl, year_dirs, score_year)
+stopCluster(cl)
+print(unlist(res))
+```
+
+```{r summary}
+# Per-file data.table accumulation. Arrow's lazy dplyr does NOT support the
+# `.data[[var]]` pronoun for dynamic column names (silently yields NaN), so compute
+# in-memory one file at a time — reliable and memory-safe over the full corpus.
+files   <- list.files(out_dir, pattern = "\\.parquet$", full.names = TRUE)
+lexcols <- paste0(names(BIAS_SEED_LEXICONS), "_lex")
+tot <- 0L; hits <- setNames(numeric(length(lexcols)), lexcols)
+for (f in files) {
+  d <- as.data.table(arrow::read_parquet(f, col_select = lexcols))
+  tot <- tot + nrow(d)
+  for (c in lexcols) hits[c] <- hits[c] + sum(d[[c]] > 0, na.rm = TRUE)
+}
+message("total lexicon-scored articles: ", tot)
+for (b in names(BIAS_SEED_LEXICONS))
+  message(sprintf("  %-12s any-hit share: %.4f", b, hits[[paste0(b, "_lex")]] / tot))
+```

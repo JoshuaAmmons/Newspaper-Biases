@@ -25,10 +25,16 @@ if (!nzchar(PROJECT_ROOT)) {
 }
 
 # ---- Paths -------------------------------------------------------------------
-DATA_RAW      <- file.path(PROJECT_ROOT, "data_raw")        # external shock downloads
-DATA_PARQUET  <- file.path(PROJECT_ROOT, "data_parquet")    # American Stories + scored articles
-DATA_PANELS   <- file.path(PROJECT_ROOT, "data_panels")     # county-period panels, crosswalks
-MODELS_DIR    <- file.path(PROJECT_ROOT, "models")          # trained classifiers, calibrators
+# Heavy data lives under DATA_ROOT, which can be pointed OUTSIDE the (Dropbox-synced)
+# repo via the CAPLAN_DATA env var so large parquet/models/panels never sync to the
+# cloud. Defaults to PROJECT_ROOT for portability (small repos / CI).
+DATA_ROOT <- Sys.getenv("CAPLAN_DATA")
+if (!nzchar(DATA_ROOT)) DATA_ROOT <- PROJECT_ROOT
+
+DATA_RAW      <- file.path(DATA_ROOT, "data_raw")           # external shock downloads
+DATA_PARQUET  <- file.path(DATA_ROOT, "data_parquet")       # American Stories + scored articles
+DATA_PANELS   <- file.path(DATA_ROOT, "data_panels")        # county-period panels, crosswalks
+MODELS_DIR    <- file.path(DATA_ROOT, "models")             # trained classifiers, calibrators
 FIGURES_DIR   <- file.path(PROJECT_ROOT, "figures")
 TABLES_DIR    <- file.path(PROJECT_ROOT, "tables")
 OUTPUT_HTML   <- file.path(PROJECT_ROOT, "output", "html")

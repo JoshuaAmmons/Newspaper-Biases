@@ -38,7 +38,17 @@ lexicon (`p_incivil := uncivil_score`). So the deployed measure *was* the lexico
 stance, no independent ground truth. Caplan fixes both: independent LLM labels (Plan 01)
 + stance-aware RoBERTa; lexicons demoted to sampling/prefilter only.
 
-## Robustness baseline (do last, if at all)
-Report a TF-IDF+RF baseline alongside RoBERTa. Expectation: comparable on the relevance
-gate, RoBERTa decisively ahead on the four stance heads — itself evidence the task is
-about stance, not vocabulary. The predecessor repo is effectively this baseline already.
+## Status: RF is FIRST-CLASS here, not optional (corrected 2026-05-25)
+Per the project directive to trust the externally-validated predecessor repo over
+intuition (and never to drop a validated step to save time/money), the
+lexicon → features → **Random Forest** pipeline is run **as a first-class step for all
+four biases**, exactly as in `american-stories-incivility`. It plays three roles:
+1. **Validated measurement** — a calibrated per-bias score, on the proven path.
+2. **Candidate selector** — RF/lexicon scores enrich the pool sent to the LLM jury
+   (alongside a stratified random base), so LLM effort lands on promising passages.
+3. **Baseline** — the comparison RoBERTa is validated *against*.
+
+RoBERTa is the **hypothesized augmentation** layered on top — expected to improve on the
+stance dimension for the reasons above — but that superiority is **demonstrated against
+the RF baseline, not presumed**. DiD is run on the RF, lexicon, AND RoBERTa measures
+(the repo's `07_did_estimation` already runs DiD on both RF and lexicon outcomes).

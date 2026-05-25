@@ -1,0 +1,139 @@
+---
+title: "06c — Baseline: Random Forest train + calibrate + score (validated RF path)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(quanteda); library(Matrix); library(ranger); library(pROC)
+BIAS <- names(BIAS_SEED_LEXICONS)
+set.seed(SEED)
+NTHREAD <- max(1L, parallel::detectCores() - 2L)
+quanteda_options(threads = NTHREAD)
+```
+
+Trains one `ranger` Random Forest per bias on **lexicon-derived pseudo-labels** (top-decile
+= positive, bottom-half = negative), with grouped-by-newspaper CV and isotonic calibration —
+exactly the `american-stories-incivility` `05_random_forest` method, generalized to four
+biases. Then **scores the full window corpus** by applying the saved TF-IDF→SVD transform
+(`06b`) batch-by-batch — the deployment the predecessor left as future work. Uses all CPU
+cores (`ranger num.threads`, `quanteda threads`).
+
+## 1. Train per-bias RF (pseudo-labels + grouped CV + calibration)
+
+```{r train}
+feat <- as.data.table(read_parquet(file.path(DATA_PANELS, "rf_features.parquet")))
+svd_cols  <- grep("^svd_", names(feat), value = TRUE)
+meta_cols <- c("front_page", "headline_len", "word_count", "has_byline", "ocr_quality")
+feature_cols <- c(svd_cols, meta_cols)
+for (c in feature_cols) set(feat, which(is.na(feat[[c]])), c, 0)
+
+models <- list(); calibs <- list(); cv_tab <- list()
+for (b in BIAS) {
+  lx  <- feat[[paste0(b, "_lex")]]
+  # Lexicon scores are zero-inflated, so percentile cutoffs collapse (p90 = p50 = 0).
+  # Distant supervision by presence/absence: any hit = positive; no hit = negative,
+  # subsampling the large negative pool to ~5x positives for a trainable balance.
+  pos <- which(lx > 0); neg <- which(lx == 0)
+  if (length(pos) < 20L) { message("  ", b, ": only ", length(pos), " positives, skipping"); next }
+  neg <- sample(neg, min(length(neg), 5L * length(pos)))
+  d <- feat[c(pos, neg)]; d[, y := factor(c(rep(1L, length(pos)), rep(0L, length(neg))))]
+
+  nps <- unique(d$newspaper_name)
+  fmap <- data.table(newspaper_name = nps, fold = sample(rep(1:5, length.out = length(nps))))
+  d <- merge(d, fmap, by = "newspaper_name")
+  actual <- as.integer(as.character(d$y)); preds <- numeric(nrow(d))
+  for (k in 1:5) {
+    tr_i <- d$fold != k
+    rf <- ranger(x = d[tr_i, ..feature_cols], y = d$y[tr_i], num.trees = 500,
+                 mtry = floor(sqrt(length(feature_cols))), min.node.size = 10,
+                 probability = TRUE, num.threads = NTHREAD, seed = SEED)
+    preds[!tr_i] <- predict(rf, d[!tr_i, ..feature_cols], num.threads = NTHREAD)$predictions[, "1"]
+  }
+  auc   <- as.numeric(pROC::auc(pROC::roc(actual, preds, quiet = TRUE)))
+  brier <- mean((preds - actual)^2)
+  calibs[[b]] <- fit_isotonic(preds, actual)
+  models[[b]] <- ranger(x = d[, ..feature_cols], y = d$y, num.trees = 500,
+                        mtry = floor(sqrt(length(feature_cols))), min.node.size = 10,
+                        probability = TRUE, num.threads = NTHREAD, seed = SEED)
+  cv_tab[[b]] <- data.table(bias = b, n = nrow(d), pos = sum(actual), auc = auc, brier = brier)
+  message(sprintf("  %-12s n=%d pos=%d AUC=%.3f Brier=%.3f", b, nrow(d), sum(actual), auc, brier))
+}
+saveRDS(list(models = models, calibs = calibs, feature_cols = feature_cols),
+        file.path(MODELS_DIR, "rf_baseline_models.rds"))
+print(rbindlist(cv_tab, fill = TRUE))
+```
+
+## 2. Score the window corpus (batched, fitted transform applied article-by-article)
+
+```{r score}
+tr <- readRDS(file.path(MODELS_DIR, "rf_feature_transform.rds"))
+center_proj <- as.numeric(tr$center %*% tr$rotation)   # 1 x n_svd
+cleaned_dir <- file.path(DATA_PARQUET, "articles_cleaned")
+lex_dir     <- file.path(DATA_PARQUET, "articles_lexscored")
+out_dir     <- file.path(DATA_PARQUET, "articles_scored_baseline")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Years to score: window years that have lexicon scores; optional CAPLAN_SCORE_YEARS override.
+avail <- as.integer(sub(".*lexscored_(\\d{4}).*", "\\1",
+           list.files(lex_dir, pattern = "lexscored_\\d{4}\\.parquet$")))
+score_years <- sort(intersect(avail, as.integer(YEARS_ANALYSIS)))
+ov <- Sys.getenv("CAPLAN_SCORE_YEARS")
+if (nzchar(ov)) {
+  sel <- unlist(lapply(strsplit(ov, ",")[[1]], function(p)
+    if (grepl("-", p)) do.call(seq, as.list(as.integer(strsplit(p, "-")[[1]]))) else as.integer(p)))
+  score_years <- sort(intersect(score_years, sel))
+}
+message("scoring years: ", paste(score_years, collapse = ", "))
+B <- 100000L
+# Optional per-year row cap for fast smoke-testing (CAPLAN_SCORE_LIMIT); unset = score all.
+score_limit <- suppressWarnings(as.integer(Sys.getenv("CAPLAN_SCORE_LIMIT")))
+
+featurize <- function(text) {
+  dm <- tokens(corpus(text), remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) |>
+    tokens_tolower() |> tokens_remove(stopwords("en")) |> tokens_wordstem() |> dfm()
+  dm <- dfm_match(dm, features = tr$vocab)               # align columns to training vocab
+  tfidf <- as(dm, "CsparseMatrix") %*% Matrix::Diagonal(x = tr$idf)
+  sweep(as.matrix(tfidf %*% tr$rotation), 2, center_proj, "-")  # = (tfidf - center) %*% rotation
+}
+
+for (yr in score_years) {
+  out <- file.path(out_dir, paste0("scored_", yr, ".parquet"))
+  if (file.exists(out)) { message(yr, ": exists"); next }
+  pf <- list.files(file.path(cleaned_dir, paste0("year=", yr)), pattern = "\\.parquet$", full.names = TRUE)[1]
+  dt <- as.data.table(read_parquet(pf, col_select = c(
+    "article_id","newspaper_name","lccn","date","page","year","word_count","ocr_nonalpha","headline","byline","article")))
+  lx <- as.data.table(read_parquet(file.path(lex_dir, paste0("lexscored_", yr, ".parquet")),
+    col_select = c("article_id", paste0(BIAS, "_lex"))))
+  dt <- merge(dt, lx, by = "article_id", all.x = TRUE)
+  if (!is.na(score_limit) && nrow(dt) > score_limit) dt <- dt[sample(.N, score_limit)]
+  pg <- suppressWarnings(as.integer(gsub("[^0-9]", "", dt$page)))
+  dt[, front_page := fifelse(!is.na(pg) & pg == 1L, 1L, 0L)]
+  dt[, headline_len := nchar(headline)]
+  dt[, has_byline := as.integer(nchar(trimws(byline)) > 0)]
+  dt[, ocr_quality := 1 - ocr_nonalpha]
+
+  n <- nrow(dt); res <- vector("list", ceiling(n / B))
+  for (i in seq_len(ceiling(n / B))) {
+    rows <- ((i - 1) * B + 1):min(i * B, n)
+    newd <- as.data.table(featurize(dt$article[rows])); setnames(newd, svd_cols)
+    newd <- cbind(newd, dt[rows, ..meta_cols])
+    ob <- dt[rows, .(article_id, newspaper_name, lccn, date, year)]
+    for (b in BIAS) {
+      if (is.null(models[[b]])) next
+      pc <- calibs[[b]](predict(models[[b]], newd, num.threads = NTHREAD)$predictions[, "1"])
+      ob[[paste0("p_", b, "_rf")]]      <- pc
+      ob[[paste0("endorse_", b, "_rf")]] <- as.integer(pc >= 0.5)
+      ob[[paste0(b, "_lex")]]            <- dt[[paste0(b, "_lex")]][rows]
+    }
+    res[[i]] <- ob
+  }
+  tmp <- paste0(out, ".tmp"); write_parquet(rbindlist(res, fill = TRUE), tmp); file.rename(tmp, out)
+  message(sprintf("  %d: scored %d articles", yr, n)); rm(dt, lx, res); gc()
+}
+```

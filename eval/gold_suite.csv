@@ -1,0 +1,35 @@
+id,text,relevance,anti_market,anti_foreign,make_work,pessimistic
+am_endorse_1,"The merchant's profit is wrung from the toil of honest men; trade itself breeds corruption.",1,endorse,none,none,none
+am_endorse_2,"Every dollar the speculator pockets is robbery; the very institution of profit is a parasite upon labor.",1,endorse,none,none,none
+am_endorse_3,"Competition is a ruinous war of all against all, and the market a soulless engine that grinds men to dust.",1,endorse,none,none,none
+am_none_fraud,"The grand jury indicted the firm for rigging the weighing scales and short-weighting its customers.",1,none,none,none,none
+am_none_report,"Wheat fell three cents on the Chicago exchange yesterday amid heavy selling.",1,none,none,none,none
+am_quote,"Senator Pratt declared that 'the profit system itself is theft,' a view the editors do not share.",1,quote,none,none,none
+am_reject,"Those who paint every merchant as a bloodsucker forget that honest trade has fed and clothed the nation.",1,reject,none,none,none
+af_endorse_1,"These newcomers from abroad will undercut our wages and corrupt our free institutions.",1,none,endorse,none,none
+af_endorse_2,"The foreign horde is a standing menace to the American workingman and must be shut out for good.",1,none,endorse,none,none
+af_endorse_3,"Cheap pauper labor from Europe is a disease upon our shores, sapping the strength of native industry.",1,none,endorse,none,none
+af_none_report,"Arrivals at the port numbered four thousand this week, the immigration commissioner reported.",1,none,none,none,none
+af_none_policy,"The senator argued for a moderate duty on imported wool on purely economic grounds.",1,none,none,none,none
+af_quote,"The mayor was quoted calling the immigrants 'a flood of undesirables,' though the paper offers no opinion.",1,none,quote,none,none
+af_reject,"To brand every immigrant a menace is nativist folly; these families enrich our towns and trades.",1,none,reject,none,none
+mw_endorse_1,"The new harvester throws good men out of work; better the field were reaped by hand.",1,none,none,endorse,none
+mw_endorse_2,"Every labor-saving machine is a thief of bread, and the state should bar its use to keep men employed.",1,none,none,endorse,none
+mw_endorse_3,"What use is efficiency if it idles honest hands? Preserve the jobs though the work be slower.",1,none,none,endorse,none
+mw_none_report,"The mill installed two electric looms this spring, the superintendent said.",1,none,none,none,none
+mw_none_layoff,"Forty hands were let go Tuesday when the plant reduced its night shift.",1,none,none,none,none
+mw_quote,"The union chief said 'machines that do the work of ten must be forbidden,' a demand we report without endorsing.",1,none,none,quote,none
+mw_reject,"Fear of machinery is a fool's creed; the loom that saves labor lifts the whole people.",1,none,none,reject,none
+pe_endorse_1,"Trade will never recover; we are sliding into permanent ruin from which there is no return.",1,none,none,none,endorse
+pe_endorse_2,"The nation is finished, doomed to an endless and hopeless decline; nothing can be saved.",1,none,none,none,endorse
+pe_endorse_3,"Every sign points to total and irretrievable catastrophe; the country is going to the dogs for good.",1,none,none,none,endorse
+pe_none_report,"The bank closed Tuesday; depositors gathered at the door, the sheriff confirmed.",1,none,none,none,none
+pe_none_sober,"Forecasters expect a lean winter for wheat, with prices likely soft into the spring.",1,none,none,none,none
+pe_quote,"The preacher cried that 'we are damned to everlasting ruin,' which the editors record without sharing.",1,none,none,none,quote
+pe_reject,"Talk of permanent collapse is craven nonsense; the country has weathered worse and will mend.",1,none,none,none,reject
+multi_af_mw,"The foreign machinist brings cheap machines that rob native men of work, a double menace from abroad.",1,none,endorse,endorse,none
+ocr_am_endorse,"Th3 profit syst3m itself is theft, wrung from the toil of the p00r and the weak.",1,endorse,none,none,none
+irr_social,"The church social on Saturday raised forty dollars toward the new organ.",0,none,none,none,none
+irr_wedding,"Miss Eleanor Hart was wed to Mr. Charles Doyle at the Methodist chapel on Sunday.",0,none,none,none,none
+irr_fair,"The county fair opens Thursday with prizes for the finest livestock and preserves.",0,none,none,none,none
+irr_weather,"A heavy frost is expected tonight; gardeners are advised to cover tender plants.",0,none,none,none,none

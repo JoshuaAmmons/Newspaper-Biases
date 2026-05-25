@@ -5,10 +5,37 @@ articles) on one workstation (24 GB GPU, 127 GB RAM), fast and resumably — by 
 the proven engineering from `american-stories-incivility`, **without** inheriting its
 correctness compromise (it let the lexicon *become* the measure and never deployed the RF).
 
-## Governing principle
+## Primary principle: fidelity to the validated path
+We follow the externally-validated `american-stories-incivility` pipeline
+(download → parse → **lexicon → features → Random Forest** → panel → DiD) because it is
+**proven**, not because it is fast. Efficiency is a *side benefit* of these patterns,
+never the justification. **No validated step is dropped or reordered to save time or
+money** — including the lexicon/RF measurement, which is a first-class step here
+(validated measure + LLM candidate-selector + baseline; see
+[`04_roberta_vs_random_forest.md`](04_roberta_vs_random_forest.md)). The LLM-jury →
+RoBERTa is layered on top as an augmentation, validated against the RF baseline.
+
+## Engineering principle
 A **cheap → expensive cascade**: every expensive op is gated behind a cheap one. Every
 stage is **year-partitioned, skip-if-exists, and `gc()`-bounded** so it survives
 interruption.
+
+## Hardware utilization (this machine: RTX PRO 5000 Blackwell 24 GB, 24-core Ultra 9, 127 GB)
+The original repo ran on a weaker box. We keep its *methods identical* but execute them
+faster on this hardware (a pure win, not a methodological shortcut):
+
+| Stage | Method (unchanged) | Hardware use |
+|---|---|---|
+| Ingest tar.gz→parquet | flatten `full articles` | **CPU:** parallel across years (multiprocessing) |
+| Clean / lexicon score | normalize, regex/1000 words | **CPU:** parallel across years |
+| Features | TF-IDF → SVD (irlba) | **CPU:** multithreaded tokenize; keep TF-IDF/SVD (no reinvention) |
+| Random Forest | ranger | **CPU:** `num.threads` = all cores |
+| LLM jury | multi-model competition | local Llama on **GPU**; cloud calls high-concurrency |
+| RoBERTa train + score | staged RoBERTa | **GPU:** CUDA torch, fp16/bf16, large batches on 24 GB — the biggest lever |
+| DiD | `fect` bootstrap | **CPU:** `cores` = all |
+
+The headline GPU win is **CUDA torch** for the RoBERTa phase (training + scoring hundreds of
+millions of articles); on the CPU-only torch it would be the slowest stage by far.
 
 ## Redesigned pipeline (adoptions marked)
 

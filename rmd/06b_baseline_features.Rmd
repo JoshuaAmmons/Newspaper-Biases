@@ -1,0 +1,121 @@
+---
+title: "06b — Baseline: TF-IDF/SVD features (validated RF path)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(quanteda); library(Matrix); library(irlba)
+BIAS <- names(BIAS_SEED_LEXICONS)
+set.seed(SEED)
+```
+
+Builds the Random-Forest feature space exactly as `american-stories-incivility`
+(`04_feature_engineering`): TF-IDF → SVD(200) on a training sample, plus metadata and the
+per-bias lexicon scores. Generalized to the four biases. Two differences, both
+method-preserving: (1) we keep the document-term matrix **sparse** (no dense 300k×10k
+blow-up) so it scales to this corpus; (2) we **save the fitted transform**
+(vocab + idf + SVD center/rotation) so `06c` can score the full corpus with the same
+features — completing the deployment the predecessor left as future work.
+
+## Parameters
+
+```{r params}
+N_TRAIN   <- 300000L   # training sample for features + RF (predecessor used ~500k)
+N_SVD     <- 200L
+TOP_FEATS <- 10000L
+YEARS     <- as.integer(YEARS_ANALYSIS)   # 1895:1945
+```
+
+## Stratified sample across analysis-window years (text + metadata + lexicon scores)
+
+```{r sample}
+cleaned_dir <- file.path(DATA_PARQUET, "articles_cleaned")
+lex_dir     <- file.path(DATA_PARQUET, "articles_lexscored")
+
+yds <- list.files(cleaned_dir, pattern = "^year=\\d{4}$", full.names = TRUE)
+yrs <- as.integer(sub(".*year=(\\d{4}).*", "\\1", yds))
+keep <- yrs %in% YEARS & file.exists(file.path(lex_dir, paste0("lexscored_", yrs, ".parquet")))
+yds <- yds[keep]; yrs <- yrs[keep]
+stopifnot(length(yds) > 0)
+
+counts <- vapply(yds, function(yd) {
+  pf <- list.files(yd, pattern = "\\.parquet$", full.names = TRUE)[1]
+  arrow::open_dataset(pf)$num_rows
+}, numeric(1))
+frac <- min(1, N_TRAIN / sum(counts))
+message(sprintf("sampling %.3f of %d articles across %d years", frac, sum(counts), length(yds)))
+
+cols <- c("article_id","newspaper_name","article","word_count","ocr_nonalpha",
+          "headline","byline","page","year")
+samp <- vector("list", length(yds))
+for (i in seq_along(yds)) {
+  yr <- yrs[i]
+  pf <- list.files(yds[i], pattern = "\\.parquet$", full.names = TRUE)[1]
+  dt <- as.data.table(arrow::read_parquet(pf, col_select = cols))
+  k <- max(1L, round(frac * nrow(dt)))
+  if (k < nrow(dt)) dt <- dt[sample(.N, k)]
+  lx <- as.data.table(arrow::read_parquet(
+    file.path(lex_dir, paste0("lexscored_", yr, ".parquet")),
+    col_select = c("article_id", paste0(BIAS, "_lex"))))
+  samp[[i]] <- merge(dt, lx, by = "article_id", all.x = TRUE)
+  rm(dt, lx); gc()
+}
+train <- rbindlist(samp, fill = TRUE); rm(samp); gc()
+message("training sample: ", nrow(train), " articles")
+```
+
+## Metadata features
+
+```{r meta}
+pg <- suppressWarnings(as.integer(gsub("[^0-9]", "", train$page)))
+train[, front_page  := fifelse(!is.na(pg) & pg == 1L, 1L, 0L)]
+train[, headline_len := nchar(headline)]
+train[, has_byline   := as.integer(nchar(trimws(byline)) > 0)]
+train[, ocr_quality  := 1 - ocr_nonalpha]
+meta_cols <- c("front_page", "headline_len", "word_count", "has_byline", "ocr_quality")
+```
+
+## TF-IDF (sparse) → SVD(200), saving the transform
+
+```{r tfidf-svd}
+toks <- tokens(corpus(train$article), remove_punct = TRUE, remove_numbers = TRUE,
+               remove_symbols = TRUE) |>
+  tokens_tolower() |> tokens_remove(stopwords("en")) |> tokens_wordstem()
+dfmat <- dfm(toks)
+dfmat <- dfm_trim(dfmat, min_termfreq = 50, min_docfreq = 20)
+dfmat <- dfm_select(dfmat, names(topfeatures(dfmat, TOP_FEATS)))
+vocab <- colnames(dfmat)
+message("vocab size: ", length(vocab))
+
+m   <- as(dfmat, "CsparseMatrix")                       # docs × vocab, counts (sparse)
+idf <- log10(nrow(m) / Matrix::colSums(m > 0))          # quanteda-style inverse df
+tfidf <- m %*% Matrix::Diagonal(x = idf)                # sparse count*idf, no densify
+rm(toks, dfmat, m); gc()
+
+svd <- irlba::prcomp_irlba(tfidf, n = N_SVD, center = TRUE, scale. = FALSE)
+svd_x <- as.data.table(svd$x); setnames(svd_x, paste0("svd_", seq_len(ncol(svd_x))))
+message("SVD components: ", ncol(svd_x))
+
+saveRDS(list(vocab = vocab, idf = idf, center = svd$center, rotation = svd$rotation,
+             n_svd = N_SVD),
+        file.path(MODELS_DIR, "rf_feature_transform.rds"))
+```
+
+## Assemble and save the training feature matrix
+
+```{r assemble}
+feat <- cbind(
+  train[, c("article_id", "newspaper_name", "year", paste0(BIAS, "_lex")), with = FALSE],
+  train[, ..meta_cols],
+  svd_x
+)
+write_parquet(feat, file.path(DATA_PANELS, "rf_features.parquet"))
+message("rf_features.parquet: ", nrow(feat), " rows x ", ncol(feat), " cols")
+print(names(feat)[1:15])
+```
