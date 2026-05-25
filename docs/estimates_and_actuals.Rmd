@@ -1,0 +1,125 @@
+---
+title: "Project Estimates & Actuals — API Cost and Runtime"
+author: "Caplan / Newspaper-Biases project"
+date: "Initiated 2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+**Living document.** It records the *predictions* made at project start and the *actuals*
+measured as each stage runs. Update the **Actual** columns and add a **Change log** entry
+whenever a stage completes or an estimate is revised. Predictions below were made on
+**2026-05-25**, before the full-corpus run, and are calibrated by smoke tests on the
+1895–1899 slice (§4).
+
+---
+
+## 1. API cost
+
+**Structural fact:** API cost is driven by the **~10k LLM labeling sample**, *not* the
+corpus. The full corpus (hundreds of millions of articles) is scored by the **local
+RoBERTa + lexicon/RF on the GPU/CPU — $0 in API calls**. Local Llama (Ollama) is also free.
+So corpus size does not move the bill; only the bounded labeling sample does.
+
+### Prediction — per full labeling pass (~10k passages)
+
+| Provider | Role | Calls | Est. cost / pass |
+|---|---|---:|---:|
+| Gemini Flash | competitor | ~10k | ~$1 |
+| GPT-4o-mini | competitor | ~10k | ~$1.5 |
+| Grok (fast) | competitor | ~10k | ~$3–5 |
+| Llama (local) | competitor | ~10k | $0 |
+| Claude Sonnet | adjudicator (~25% contested) | ~2.5k | ~$12 |
+| **One pass** | | | **~$18–25** |
+
+**Project total estimate: ~$40–80** (expect 2–4 passes: codebook/prompt tuning, gold-suite
+validity loop, final clean run). Dominated by Claude adjudication.
+
+*Assumptions:* ~600 input + ~120 output tokens/call; ~25% of passages contested → adjudicated;
+representative early-2026 pricing. Biggest uncertainties: Grok pricing, contested rate, # passes.
+
+*Cost-reduction levers:* batch endpoints (~50% off cloud calls); Haiku instead of Sonnet for
+adjudication (~3–4× cheaper); tighter contested threshold.
+
+### Actual spend (update as incurred)
+
+| Item | Date | Actual | Notes |
+|---|---|---:|---|
+| Gold-suite eval (×2 runs, 34 passages) | 2026-05-25 | ~$0.10–0.20 | preflight + 2 full jury runs on the validity set |
+| Full labeling pass #1 | — | TBD | |
+| Full labeling pass #2 | — | TBD | |
+| **Running total** | | **~$0.20** | |
+
+---
+
+## 2. Runtime & compute (full analysis window, ~150–250M articles)
+
+```{r download-elapsed, results='asis'}
+log <- file.path(Sys.getenv("CAPLAN_DATA", "C:/Users/jdamm/Caplan"), "download.log")
+if (file.exists(log)) {
+  ll <- grep("^\\d{4}-\\d{2}-\\d{2}", readLines(log), value = TRUE)
+  ts <- as.POSIXct(substr(ll, 1, 19), format = "%Y-%m-%d %H:%M:%S")
+  cat(sprintf("*Auto-pulled:* download.log spans %s → %s (%.1f h wall-clock, incl. restarts/stalls).\n",
+              format(min(ts, na.rm = TRUE)), format(max(ts, na.rm = TRUE)),
+              as.numeric(difftime(max(ts, na.rm = TRUE), min(ts, na.rm = TRUE), units = "hours"))))
+} else cat("*download.log not found.*\n")
+```
+
+### Prediction — by stage
+
+| Stage | Type | Estimate | Actual | Notes |
+|---|---|---|---|---|
+| Corpus download | wait (network) | ~5 h | TBD | ~75–110 GB/hr observed |
+| Ingest tar.gz → parquet | CPU (parallel) | ~1–2 h | TBD | |
+| Clean (02) | CPU | ~2–4 h | TBD | ~25 min / 25.7M (slice) |
+| Geolink LCCN→county (03) | network (cached) | ~1–2 h | TBD | bounded by # titles |
+| Lexicon scoring (06a) | CPU (parallel) | ~1–3 h | TBD | 25.7M in minutes (slice) |
+| RF features + train (06b/c) | CPU | ~0.5–1 h | TBD | minutes on slice |
+| **RF corpus scoring (06c)** | **CPU (heavy)** | **~4–12 h** | TBD | tokenize+project 200M — CPU bottleneck |
+| LLM jury labeling (~10k) | API + local GPU | ~2–6 h | TBD | throughput-bound |
+| RoBERTa train | GPU | ~1–2 h | TBD | small labeled set |
+| **RoBERTa corpus scoring** | **GPU (heavy)** | **~8–24 h** | TBD | 200M on one 24 GB GPU |
+| Shock data prep (08) | human/network | hours–days | TBD | NHGIS/NOAA/IPUMS extracts |
+| Panel + DiD + robustness (07/09/10) | CPU | ~4–8 h | TBD | fect/CS bootstrap × 4 designs × 3 measures |
+| Figures/tables (11) | CPU | minutes | TBD | |
+
+### Headline
+
+- **Pure machine compute: ~2–3 days**, dominated by the two full-corpus scoring passes.
+- The RF pass is **CPU-bound** and the RoBERTa pass is **GPU-bound**, so they **run
+  concurrently** → critical path ≈ max(RF, RoBERTa) ≈ **~½–1 day**, not the sum.
+- **Compressed wall-clock with overlap: ~1.5–2.5 days** of the machine working.
+- **Calendar incl. human/data waits: ~3–5 days** to final DiD tables (shock-data acquisition
+  and codebook/jury validation iteration are the non-compute long poles; they overlap compute).
+
+### Caveats
+
+- The two corpus-scoring estimates are **extrapolated from small slices** — the biggest
+  uncertainty. A timed full-year benchmark (one real window year, end-to-end) would replace
+  the extrapolation with measured numbers; **do this once the corpus finishes downloading.**
+- Everything is **per-year checkpointed/resumable** — reboots/stalls cost restart time, not redo.
+- If RF corpus scoring drags, narrow it to just the window years the DiD actually needs.
+
+---
+
+## 3. Calibration data points — smoke tests on the 1895–1899 slice (2026-05-25)
+
+| Metric | Observed |
+|---|---|
+| Articles cleaned (1895–1899) | 25.77M (~82% kept after OCR/length filters) |
+| Lexicon any-hit rate | anti_market 0.69% · pessimistic 1.13% · anti_foreign 0.04% · make_work 0.02% |
+| RF baseline AUC (random-sample, thin) | am 0.90 · af 0.89 · mw 0.79 · pe 0.84 |
+| RF positives after oversampling | am 30k (cap) · af 11.5k · mw 4.9k · pe 30k (cap) |
+| Jury vs gold suite | relevance 1.0; endorse precision 1.0; recall 1.0 on 3/4 biases |
+| Jury contested rate (gold suite) | 32.4% (11/34) — note: harder than a typical corpus sample |
+
+---
+
+## 4. Change log
+
+- **2026-05-25** — Initial cost and runtime predictions recorded (pre-full-run). Calibrated by
+  the 1895–1899 smoke tests. RF baseline + multi-LLM jury validated end-to-end on the slice;
+  full corpus still downloading (~137/180 at time of writing).

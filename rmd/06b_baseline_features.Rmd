@@ -26,7 +26,8 @@ features — completing the deployment the predecessor left as future work.
 ## Parameters
 
 ```{r params}
-N_TRAIN   <- 300000L   # training sample for features + RF (predecessor used ~500k)
+N_BASE    <- 100000L   # stratified random base (negatives + relevance signal)
+N_POS_PER <- 30000L    # cap of lexicon-positive oversample PER bias (rare biases keep all)
 N_SVD     <- 200L
 TOP_FEATS <- 10000L
 YEARS     <- as.integer(YEARS_ANALYSIS)   # 1895:1945
@@ -44,30 +45,36 @@ keep <- yrs %in% YEARS & file.exists(file.path(lex_dir, paste0("lexscored_", yrs
 yds <- yds[keep]; yrs <- yrs[keep]
 stopifnot(length(yds) > 0)
 
-counts <- vapply(yds, function(yd) {
-  pf <- list.files(yd, pattern = "\\.parquet$", full.names = TRUE)[1]
-  arrow::open_dataset(pf)$num_rows
-}, numeric(1))
-frac <- min(1, N_TRAIN / sum(counts))
-message(sprintf("sampling %.3f of %d articles across %d years", frac, sum(counts), length(yds)))
-
+# Oversample lexicon-positives so rare biases (anti_foreign/make_work) have enough RF
+# training positives, alongside a stratified random base (negatives + relevance signal).
+# Read each year, join lexicon scores, peel off per-bias positives + a random base.
 cols <- c("article_id","newspaper_name","article","word_count","ocr_nonalpha",
           "headline","byline","page","year")
-samp <- vector("list", length(yds))
+base_per_year <- ceiling(N_BASE / length(yds))
+pos  <- setNames(lapply(BIAS, function(.) vector("list", length(yds))), BIAS)
+base <- vector("list", length(yds))
 for (i in seq_along(yds)) {
   yr <- yrs[i]
   pf <- list.files(yds[i], pattern = "\\.parquet$", full.names = TRUE)[1]
   dt <- as.data.table(arrow::read_parquet(pf, col_select = cols))
-  k <- max(1L, round(frac * nrow(dt)))
-  if (k < nrow(dt)) dt <- dt[sample(.N, k)]
   lx <- as.data.table(arrow::read_parquet(
     file.path(lex_dir, paste0("lexscored_", yr, ".parquet")),
     col_select = c("article_id", paste0(BIAS, "_lex"))))
-  samp[[i]] <- merge(dt, lx, by = "article_id", all.x = TRUE)
+  dt <- merge(dt, lx, by = "article_id", all.x = TRUE)
+  for (b in BIAS) pos[[b]][[i]] <- dt[get(paste0(b, "_lex")) > 0]
+  base[[i]] <- dt[sample(.N, min(.N, base_per_year))]
   rm(dt, lx); gc()
 }
-train <- rbindlist(samp, fill = TRUE); rm(samp); gc()
-message("training sample: ", nrow(train), " articles")
+parts <- base
+for (b in BIAS) {
+  pb <- rbindlist(pos[[b]], fill = TRUE)
+  if (nrow(pb) > N_POS_PER) pb <- pb[sample(.N, N_POS_PER)]
+  message(sprintf("  %-12s positives in sample: %d", b, nrow(pb)))
+  parts[[length(parts) + 1L]] <- pb
+}
+train <- unique(rbindlist(parts, fill = TRUE), by = "article_id")
+rm(pos, base, parts); gc()
+message("training sample: ", nrow(train), " articles (random base + per-bias positive oversample)")
 ```
 
 ## Metadata features
