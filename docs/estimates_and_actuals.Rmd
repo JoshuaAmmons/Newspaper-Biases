@@ -78,22 +78,38 @@ if (file.exists(log)) {
 | Geolink LCCN→county (03) | network (cached) | ~1–2 h | TBD | bounded by # titles |
 | Lexicon scoring (06a) | CPU (parallel) | ~1–3 h | TBD | 25.7M in minutes (slice) |
 | RF features + train (06b/c) | CPU | ~0.5–1 h | TBD | minutes on slice |
-| **RF corpus scoring (06c)** | **CPU (heavy)** | **~4–12 h** | TBD | tokenize+project 200M — CPU bottleneck |
+| **RF corpus scoring (06c)** | **CPU (heavy)** | **~days–weeks** ⚠ | TBD | tokenize+project ~200M; incivility punted on this at scale |
 | LLM jury labeling (~10k) | API + local GPU | ~2–6 h | TBD | throughput-bound |
 | RoBERTa train | GPU | ~1–2 h | TBD | small labeled set |
-| **RoBERTa corpus scoring** | **GPU (heavy)** | **~8–24 h** | TBD | 200M on one 24 GB GPU |
+| **RoBERTa corpus scoring** | **GPU (heavy)** | **~weeks–months** ⚠ | TBD | REVISED — incivility ≈3 mo on RTX 4000 Ada (full corpus), still incomplete (§3); the dominant, gating cost |
 | Shock data prep (08) | human/network | hours–days | TBD | NHGIS/NOAA/IPUMS extracts |
 | Panel + DiD + robustness (07/09/10) | CPU | ~4–8 h | TBD | fect/CS bootstrap × 4 designs × 3 measures |
 | Figures/tables (11) | CPU | minutes | TBD | |
 
-### Headline
+### Headline — REVISED 2026-05-25 (see §3 external calibration)
 
-- **Pure machine compute: ~2–3 days**, dominated by the two full-corpus scoring passes.
-- The RF pass is **CPU-bound** and the RoBERTa pass is **GPU-bound**, so they **run
-  concurrently** → critical path ≈ max(RF, RoBERTa) ≈ **~½–1 day**, not the sum.
-- **Compressed wall-clock with overlap: ~1.5–2.5 days** of the machine working.
-- **Calendar incl. human/data waits: ~3–5 days** to final DiD tables (shock-data acquisition
-  and codebook/jury validation iteration are the non-compute long poles; they overlap compute).
+> ⚠️ The original estimate was **too optimistic by ~1–2 orders of magnitude** on the
+> corpus-scoring stages. Decisive real-world evidence (the incivility project: ~3 months of
+> transformer scoring on an RTX 4000 Ada, full corpus, still ~6 years from done) shows
+> full-corpus transformer scoring is a **weeks-to-months** job, not hours.
+
+**Revised:**
+
+- **Buildable/validatable part** (data prep, jury labeling ~10k, RF/RoBERTa *training*,
+  panel/DiD): **~days to ~2 weeks**.
+- **Full-corpus scoring (RoBERTa stance, and the RF pass): ~weeks-to-months** — the dominant,
+  timeline-gating cost, even on the Blackwell. This is the "hand off to long-running agents"
+  part the plan always anticipated.
+- **Total project to final DiD: ~weeks to a few months**, gated almost entirely by scoring.
+
+**Levers that may pull Caplan below incivility's ~3 months (but not to days):** (1) score only
+the **1895–1945 window** (~¼ the years); (2) the **staged relevance gate** — run the expensive
+stance heads only on the ~5–10% relevant articles; (3) Blackwell 24 GB vs 4000 Ada 12 GB
+(~2–3× + bigger batches); (4) fp16/bf16 + ONNX/TensorRT + tuned batch size. Best case maybe
+**~1–4 weeks** for scoring — to be replaced by a measured one-year benchmark (§2 caveats).
+
+*Original (superseded) estimate, retained for the predictions-vs-actuals record:* ~2–3 days
+compute / ~1.5–2.5 days overlapped / ~3–5 days calendar.
 
 ### Caveats
 
@@ -113,8 +129,19 @@ if (file.exists(log)) {
 | Lexicon any-hit rate | anti_market 0.69% · pessimistic 1.13% · anti_foreign 0.04% · make_work 0.02% |
 | RF baseline AUC (random-sample, thin) | am 0.90 · af 0.89 · mw 0.79 · pe 0.84 |
 | RF positives after oversampling | am 30k (cap) · af 11.5k · mw 4.9k · pe 30k (cap) |
+| RF baseline AUC (oversampled, final) | am 0.92 · af 0.95 · **mw 0.93 (was 0.79)** · pe 0.85 |
 | Jury vs gold suite | relevance 1.0; endorse precision 1.0; recall 1.0 on 3/4 biases |
 | Jury contested rate (gold suite) | 32.4% (11/34) — note: harder than a typical corpus sample |
+
+### External real-world calibration (decisive for runtime)
+
+The **incivility project** — same *American Stories* corpus, the predecessor pipeline — has
+run on a Lenovo (i9 13th-gen, 128 GB RAM, **RTX 4000 Ada 12 GB**) for **~3 months**, largely
+on the transformer scoring step, and still has **~6 years left to score** before analysis.
+That implies real sustained throughput on the order of **tens of articles/sec** — roughly
+1–2 orders of magnitude below the ~thousands/sec the original estimate assumed. **Anchor the
+corpus-scoring runtime to this evidence, not to extrapolation.** Caplan's better GPU + windowed
+scope + staged relevance gate may beat it, but the cost is the weeks-to-months class.
 
 ---
 
@@ -123,3 +150,9 @@ if (file.exists(log)) {
 - **2026-05-25** — Initial cost and runtime predictions recorded (pre-full-run). Calibrated by
   the 1895–1899 smoke tests. RF baseline + multi-LLM jury validated end-to-end on the slice;
   full corpus still downloading (~137/180 at time of writing).
+- **2026-05-25 (revision)** — Runtime estimate **substantially revised upward** for corpus
+  scoring after real-world evidence: the incivility project has spent ~3 months on transformer
+  scoring (RTX 4000 Ada, full corpus) and is not done (§3). Corpus scoring is now estimated at
+  **weeks-to-months** (was hours) — the timeline-gating step and the long-running hand-off.
+  Original optimistic estimate retained for the record. API-cost estimate unchanged (it's
+  driven by the bounded ~10k labeling sample, not the corpus).
