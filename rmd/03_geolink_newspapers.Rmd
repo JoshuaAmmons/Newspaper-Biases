@@ -1,0 +1,125 @@
+---
+title: "03 — Link newspapers to publication county (FIPS)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(dplyr)
+```
+
+Builds the crosswalk `data_panels/xwalk_lccn_county.parquet` mapping each newspaper
+(LCCN / title) to its **publication county FIPS** — the join key for every shock dataset.
+See docs/DATA_SOURCES.md §B1. Strategy: pull the Chronicling America title authority list
+(LCCN → place of publication), join to the corpus, resolve place → county FIPS.
+
+## 1. Get the Chronicling America title list
+
+```{r ca-titles}
+library(httr2); library(jsonlite)
+ca_raw <- file.path(DATA_RAW, "chronicling_america")
+dir.create(ca_raw, showWarnings = FALSE, recursive = TRUE)
+titles_path <- file.path(ca_raw, "ca_titles.parquet")
+
+if (!file.exists(titles_path)) {
+  # The loc.gov / Chronicling America API lists newspapers with lccn, title, state,
+  # county, city, place_of_publication. Paginate through the JSON feed.
+  # TODO(human): confirm the endpoint/params for your LoC snapshot; a manual CSV
+  # export dropped at data_raw/chronicling_america/ca_titles.csv also works.
+  base <- "https://chroniclingamerica.loc.gov/newspapers/?format=json"
+  resp <- request(base) |> req_user_agent("caplan-newspaper-bias/research") |>
+    req_perform()
+  js <- resp_body_json(resp, simplifyVector = TRUE)
+  titles <- as.data.table(js$newspapers)   # columns include lccn, title, state, county, city
+  arrow::write_parquet(titles, titles_path)
+} else {
+  titles <- as.data.table(read_parquet(titles_path))
+}
+message("CA titles: ", nrow(titles), " rows; cols: ",
+        paste(names(titles), collapse = ", "))
+```
+
+## 2. Extract an LCCN from the corpus
+
+```{r corpus-lccn}
+ds <- open_dataset(file.path(DATA_PARQUET, "articles_cleaned"))
+# Pull the distinct newspaper identity columns present in the corpus.
+id_cols <- intersect(c("article_id", "lccn", "newspaper_name"), names(ds$schema))
+nl <- ds |> select(all_of(id_cols)) |> distinct() |> collect() |> as.data.table()
+
+# American Stories often encodes the LCCN (pattern "sn" + 8 digits) inside the
+# article_id or a dedicated field. Try to recover it.
+if (!"lccn" %in% names(nl)) {
+  nl[, lccn := stringi::stri_extract_first_regex(article_id, "sn\\d{8}")]
+}
+message("Distinct papers: ", nrow(nl),
+        "; with LCCN: ", sum(!is.na(nl$lccn)))
+```
+
+## 3. Resolve place of publication → county FIPS
+
+```{r to-fips}
+# Join corpus papers to CA titles on LCCN (preferred) then normalized title.
+norm <- function(x) tolower(trimws(gsub("[^a-z ]", "", tolower(x))))
+titles[, title_norm := norm(title)]
+if ("newspaper_name" %in% names(nl)) nl[, title_norm := norm(newspaper_name)]
+
+xwalk <- merge(nl, titles[, .(lccn, title_norm, state, county, city)],
+               by = "lccn", all.x = TRUE, suffixes = c("", "_ca"))
+# fallback join on title for rows that missed on LCCN
+miss <- is.na(xwalk$state) & "title_norm" %in% names(xwalk)
+if (any(miss)) {
+  fb <- merge(xwalk[miss, .(article_id, title_norm)],
+              titles[, .(title_norm, state, county, city)],
+              by = "title_norm", all.x = TRUE)
+  xwalk[miss, c("state", "county", "city") := fb[, .(state, county, city)]]
+}
+
+# (state, county name) -> 5-digit FIPS via usmap. County-name spellings vary;
+# usmap::fips() handles most. Unmatched go to a patch file.
+get_fips <- function(state, county) {
+  out <- rep(NA_character_, length(state))
+  for (i in seq_along(state)) {
+    if (is.na(state[i]) || is.na(county[i])) next
+    f <- tryCatch(usmap::fips(state = state[i], county = county[i]),
+                  error = function(e) NA_character_)
+    out[i] <- f
+  }
+  out
+}
+xwalk[, fips := get_fips(state, county)]
+
+matched   <- xwalk[!is.na(fips)]
+unmatched <- xwalk[is.na(fips)]
+message(sprintf("FIPS matched: %d / %d (%.1f%%)",
+                nrow(matched), nrow(xwalk), 100 * nrow(matched) / nrow(xwalk)))
+
+write_parquet(matched, file.path(DATA_PANELS, "xwalk_lccn_county.parquet"))
+fwrite(unmatched, file.path(DATA_PANELS, "xwalk_unmatched.csv"))
+# TODO(human): hand-patch xwalk_unmatched.csv (county spellings, defunct counties,
+# multi-county metros), append to the parquet, and re-run downstream steps.
+```
+
+## 4. Coverage diagnostics
+
+```{r coverage}
+# Add Census region for stratified sampling (step 04) and regional trends.
+region_of <- function(st) {
+  ne <- c("CT","ME","MA","NH","RI","VT","NJ","NY","PA")
+  mw <- c("IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD")
+  so <- c("DE","FL","GA","MD","NC","SC","VA","WV","DC","AL","KY","MS","TN","AR","LA","OK","TX")
+  we <- c("AZ","CO","ID","MT","NV","NM","UT","WY","AK","CA","HI","OR","WA")
+  fifelse(st %in% ne, "Northeast",
+    fifelse(st %in% mw, "Midwest",
+      fifelse(st %in% so, "South",
+        fifelse(st %in% we, "West", NA_character_))))
+}
+matched[, region := region_of(state)]
+matched[, .N, by = region][order(-N)] |> print()
+write_parquet(matched, file.path(DATA_PANELS, "xwalk_lccn_county.parquet"))
+```

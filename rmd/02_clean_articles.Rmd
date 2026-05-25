@@ -1,0 +1,90 @@
+---
+title: "02 — Clean & filter articles"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table)
+```
+
+Cleans the raw per-year Parquet into a partitioned dataset `data_parquet/articles_cleaned/`
+(one part per year). Steps: ensure a stable `article_id`, normalize whitespace, compute an
+OCR-quality proxy, drop unusably short/noisy articles, and stamp `year`.
+
+## Inspect the raw schema first
+
+```{r schema}
+raw_files <- list.files(DATA_PARQUET, pattern = "^articles_\\d{4}\\.parquet$",
+                        full.names = TRUE)
+stopifnot(length(raw_files) > 0)
+print(names(read_parquet(raw_files[1], as_data_frame = FALSE)$schema))
+# American Stories typically exposes: article_id, newspaper_name, edition, date,
+# page, headline, byline, article (text), and an lccn-bearing id. Adjust the
+# column names below if your snapshot differs.
+TEXT_COL <- "article"      # main body text
+ID_COL   <- "article_id"   # stable id (created from a hash if absent)
+```
+
+## Clean, filter, partition
+
+```{r clean}
+cleaned_dir <- file.path(DATA_PARQUET, "articles_cleaned")
+dir.create(cleaned_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Tunable filters (record chosen values in docs/PROJECT_PLAN.md if changed)
+MIN_WORDS   <- 25      # drop fragments
+MAX_NONALPHA <- 0.40   # drop badly OCR'd scans
+
+for (rf in raw_files) {
+  yr <- as.integer(gsub(".*articles_(\\d{4})\\.parquet", "\\1", rf))
+  outdir  <- file.path(cleaned_dir, paste0("year=", yr))
+  outpath <- file.path(outdir, "part-0.parquet")
+  if (file.exists(outpath)) { message("Year ", yr, " already cleaned, skip"); next }
+
+  dt <- as.data.table(read_parquet(rf))
+  setnames(dt, TEXT_COL, "article", skip_absent = TRUE)
+
+  # stable id
+  if (!ID_COL %in% names(dt)) {
+    dt[, article_id := paste0(yr, "_", .I)]
+  } else if (ID_COL != "article_id") {
+    setnames(dt, ID_COL, "article_id")
+  }
+
+  # normalize whitespace; compute quality metrics
+  dt[, article := stringi::stri_replace_all_regex(article, "\\s+", " ")]
+  dt[, article := trimws(article)]
+  dt[, word_count   := count_words(article)]
+  dt[, ocr_nonalpha := share_nonalpha(article)]
+  dt[, year := yr]
+
+  before <- nrow(dt)
+  dt <- dt[word_count >= MIN_WORDS & (is.na(ocr_nonalpha) | ocr_nonalpha <= MAX_NONALPHA)]
+  # exact-duplicate text drop (syndicated boilerplate handled separately later)
+  dt <- unique(dt, by = "article")
+
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  write_parquet(dt, outpath)
+  message(sprintf("Year %d: %d -> %d articles kept (%.1f%%)",
+                  yr, before, nrow(dt), 100 * nrow(dt) / before))
+  rm(dt); gc()
+}
+```
+
+## Summary
+
+```{r summary}
+ds <- open_dataset(cleaned_dir)
+library(dplyr)
+ds |>
+  group_by(year) |>
+  summarise(n = n(), med_words = median(word_count, na.rm = TRUE),
+            med_nonalpha = median(ocr_nonalpha, na.rm = TRUE), .groups = "drop") |>
+  collect() |> arrange(year) |> print(n = 100)
+```

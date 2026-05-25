@@ -1,0 +1,97 @@
+---
+title: "04 — Stratified sample for labeling"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(dplyr)
+set.seed(SEED)
+```
+
+Builds `data_panels/label_queue.parquet`: the passages to label (LLM + human audit, step 05).
+Two ingredients (docs/PROJECT_PLAN.md §6.1): a **stratified random base** (across decade ×
+region, so the model sees ordinary text and the relevance gate is calibrated) plus
+**oversampled positives** for each bias using the seed lexicons in `R/helpers.R`
+(`BIAS_SEED_LEXICONS`) — lexicons are for *finding candidates only*, never the final measure.
+
+## Parameters
+
+```{r params}
+N_BASE     <- 4000   # stratified random passages (relevance-gate + negatives)
+N_POS_PER  <- 1500   # oversampled candidate-positive passages PER bias
+# => ~4000 + 4*1500 = ~10k passages to weak-label; audit a stratified subset by hand.
+```
+
+## Load cleaned corpus + region
+
+```{r load}
+ds <- open_dataset(file.path(DATA_PARQUET, "articles_cleaned"))
+xwalk <- read_parquet(file.path(DATA_PANELS, "xwalk_lccn_county.parquet")) |>
+  as.data.table()
+key_col <- if ("lccn" %in% names(xwalk)) "lccn" else "article_id"
+
+# Restrict to the analysis window to keep the sample on-target.
+yrs <- as.integer(YEARS_ANALYSIS)
+base_tbl <- ds |>
+  filter(year %in% yrs) |>
+  select(article_id, article, year, any_of(c("lccn", "newspaper_name"))) |>
+  collect() |> as.data.table()
+
+base_tbl <- merge(base_tbl, xwalk[, .(key = get(key_col), region)],
+                  by.x = if ("lccn" %in% names(base_tbl)) "lccn" else "article_id",
+                  by.y = "key", all.x = TRUE)
+base_tbl[is.na(region), region := "Unknown"]
+base_tbl[, decade := (year %/% 10) * 10]
+message("Articles in window: ", nrow(base_tbl))
+```
+
+## Stratified random base
+
+```{r base-sample}
+strata <- base_tbl[, .(n = .N), by = .(decade, region)]
+strata[, take := pmax(1, round(N_BASE * n / sum(n)))]
+base_sample <- base_tbl[, .SD[sample(.N, min(.N, strata[.(decade[1], region[1]),
+                              on = .(decade, region), take]))],
+                        by = .(decade, region)]
+base_sample[, sample_reason := "base_stratified"]
+message("Base sample: ", nrow(base_sample))
+```
+
+## Oversample candidate positives per bias
+
+```{r oversample}
+pos_list <- list()
+for (b in names(BIAS_SEED_LEXICONS)) {
+  base_tbl[, sc := lexicon_score(article, BIAS_SEED_LEXICONS[[b]])]
+  cand <- base_tbl[sc > 0][order(-sc)]
+  take <- head(cand, N_POS_PER)
+  take[, sample_reason := paste0("seed_", b)]
+  pos_list[[b]] <- take
+  message(sprintf("  %-12s candidates>0: %d, taken: %d", b, nrow(cand), nrow(take)))
+}
+base_tbl[, sc := NULL]
+pos_sample <- rbindlist(pos_list, fill = TRUE)
+```
+
+## Combine, dedupe, write queue
+
+```{r write}
+queue <- rbindlist(list(base_sample, pos_sample), fill = TRUE)
+queue <- unique(queue, by = "article_id")           # an article enters once
+setnames(queue, "article", "text", skip_absent = TRUE)
+keep <- intersect(c("article_id", "text", "year", "region", "decade",
+                    "lccn", "newspaper_name", "sample_reason"), names(queue))
+queue <- queue[, ..keep]
+
+write_parquet(queue, file.path(DATA_PANELS, "label_queue.parquet"))
+message("label_queue.parquet: ", nrow(queue), " passages")
+print(queue[, .N, by = sample_reason][order(-N)])
+```
+
+Next: `python/llm_label.py` weak-labels this queue; `rmd/05` audits + builds train/dev/test.

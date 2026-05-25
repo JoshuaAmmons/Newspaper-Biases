@@ -1,0 +1,30 @@
+# Python dependencies for the Caplan newspaper-bias project.
+#   python -m pip install -r requirements.txt
+#
+# NOTE on PyTorch + CUDA: install the CUDA build of torch SEPARATELY first so you
+# get GPU acceleration (transformer fine-tuning + batched inference). Example for
+# CUDA 12.1 wheels:
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Then run `python python/00_setup_check.py` and confirm torch.cuda.is_available().
+
+# --- corpus download ---
+datasets>=2.18
+huggingface_hub>=0.23
+pyarrow>=15
+pandas>=2.0
+numpy>=1.26
+
+# --- transformers / modeling ---
+transformers>=4.40
+accelerate>=0.30
+scikit-learn>=1.4        # metrics, calibration cross-checks, stratified splits
+sentencepiece>=0.2       # tokenizer backends
+evaluate>=0.4            # F1 / PR metrics during training
+tqdm>=4.66
+
+# --- LLM weak-labeling (pick the client you use in python/llm_label.py) ---
+google-generativeai>=0.7 # Gemini (the Ideas repo used Gemini Flash for labeling)
+anthropic>=0.34          # optional alternative labeler
+
+# torch is intentionally NOT pinned here — install the CUDA build via the index-url
+# command above so pip does not pull the CPU-only wheel.

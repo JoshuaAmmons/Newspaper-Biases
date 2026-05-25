@@ -1,0 +1,50 @@
+---
+title: "01 — Download American Stories data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+```
+
+Downloads the American Stories corpus year-by-year via the Python `datasets` library
+(system Python, to avoid reticulate venv issues) and writes one Parquet per year to
+`data_parquet/articles_<year>.parquet`. See `download_data.py`.
+
+Start with the **primary analysis window** (`r min(YEARS_ANALYSIS)`–`r max(YEARS_ANALYSIS)`)
+where the county shock datasets exist; download the full 1774–1960 span later for the
+descriptive national-trend figures.
+
+```{r download}
+# Primary window first. For the full span call with no args (slow, large).
+start_year <- as.integer(min(YEARS_ANALYSIS))
+end_year   <- as.integer(max(YEARS_ANALYSIS))
+
+message("Downloading American Stories ", start_year, "-", end_year, " ...")
+exit_code <- system2(
+  PYTHON_EXE,
+  args = c(shQuote(file.path(PROJECT_ROOT, "download_data.py")),
+           start_year, end_year),
+  stdout = "", stderr = "", wait = TRUE
+)
+if (exit_code != 0) warning("download_data.py exited with code ", exit_code)
+```
+
+## Summary
+
+```{r summary}
+parquet_files <- list.files(DATA_PARQUET, pattern = "^articles_\\d{4}\\.parquet$",
+                            full.names = TRUE)
+message("Total per-year Parquet files: ", length(parquet_files))
+if (length(parquet_files)) {
+  info <- file.info(parquet_files)
+  info$year <- as.integer(gsub(".*articles_(\\d{4})\\.parquet", "\\1", rownames(info)))
+  message("Years: ", min(info$year), "-", max(info$year),
+          " (", nrow(info), " files)")
+  message("Total size: ", round(sum(info$size) / 1e9, 2), " GB")
+}
+```

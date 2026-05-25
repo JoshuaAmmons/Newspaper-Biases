@@ -1,0 +1,182 @@
+---
+title: "10 — Robustness & sensitivity"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+source(file.path(PROJECT_ROOT, "R", "did_wrapper.R"))
+library(arrow); library(data.table); library(fixest); library(ggplot2)
+res <- readRDS(file.path(MODELS_DIR, "did_results.rds"))
+```
+
+The robustness program (docs/PROJECT_PLAN.md §8). The HonestDiD + leave-one-out workflow is
+adapted from the proven implementation in the companion project. The flagship design
+(anti-market ← bank distress) gets the full treatment; the helpers are reusable for the
+others.
+
+```{r flagship-twfe}
+d <- as.data.table(read_parquet(file.path(DATA_PANELS, "did_bank_distress.parquet")))
+d[, fips_int := as.integer(factor(fips))]
+d[, treat_cohort := ifelse(is.na(treat_year), 0L, treat_year)]
+d[, rel_time := ifelse(treat_cohort == 0, NA_integer_, year - treat_cohort)]
+Y <- "anti_market_share"
+```
+
+## 1. Pre-trends (parallel-trends joint test)
+
+```{r pretrends}
+mx <- 6
+d[, rel_b := pmax(-mx, pmin(mx, rel_time))]
+m_es <- feols(as.formula(sprintf("%s ~ i(rel_b, ref=-1) | fips + year", Y)),
+              d, cluster = ~fips)
+pre <- grep("rel_b::-", names(coef(m_es)), value = TRUE)
+if (length(pre)) {
+  w <- wald(m_es, keep = "rel_b::-")
+  message("Bank pre-trend joint Wald p = ", signif(w$p, 3),
+          " (large p => pre-trends not detected)")
+}
+for (nm in c("wwi_exp", "immigration_1924_exp")) if (!is.null(res[[nm]])) {
+  w <- tryCatch(wald(res[[nm]], keep = "k::-"), error = function(e) NULL)
+  if (!is.null(w)) message(nm, " pre-trend joint Wald p = ", signif(w$p, 3))
+}
+```
+
+## 2. Placebo (fake the treatment 5 years early)
+
+```{r placebo}
+dp <- copy(d)
+dp[, tc := ifelse(treat_cohort == 0, 0L, treat_cohort - 5L)]
+dp[, rb := ifelse(tc == 0, NA_integer_, pmax(-mx, pmin(mx, year - tc)))]
+m_pl <- feols(as.formula(sprintf("%s ~ i(rb, ref=-1) | fips + year", Y)), dp, cluster = ~fips)
+saveRDS(m_pl, file.path(MODELS_DIR, "placebo_bank.rds"))
+message("Placebo ATT(k=1) = ", signif(coef(m_pl)["rb::1"], 3), " (expected ~0)")
+```
+
+## 3. HonestDiD sensitivity (Rambachan & Roth)
+
+```{r honestdid}
+if (requireNamespace("HonestDiD", quietly = TRUE)) {
+  library(HonestDiD)
+  nm <- grep("^rel_b::", names(coef(m_es)), value = TRUE)
+  per <- as.integer(sub("rel_b::", "", nm)); ord <- order(per)
+  betahat <- coef(m_es)[nm][ord]; sigma <- vcov(m_es)[nm, nm][ord, ord]
+  per <- per[ord]
+  numPre  <- sum(per < -1)   # periods before the omitted -1
+  numPost <- sum(per >= 0)
+  message("HonestDiD: ", numPre, " pre, ", numPost, " post periods")
+
+  # smoothness restriction (Delta^SD): bound on change in slope of the trend
+  sm <- tryCatch(createSensitivityResults(betahat = betahat, sigma = sigma,
+          numPrePeriods = numPre, numPostPeriods = numPost,
+          Mvec = seq(0, 0.01, by = 0.002), alpha = 0.05),
+        error = function(e) { message("smoothness failed: ", e$message); NULL })
+  # relative-magnitudes restriction (Delta^RM): post-trend <= Mbar * max pre-trend
+  rm <- tryCatch(createSensitivityResults_relativeMagnitudes(betahat = betahat,
+          sigma = sigma, numPrePeriods = numPre, numPostPeriods = numPost,
+          Mbarvec = seq(0, 2, by = 0.5), alpha = 0.05),
+        error = function(e) { message("relmag failed: ", e$message); NULL })
+  saveRDS(list(smoothness = sm, relmag = rm), file.path(MODELS_DIR, "honestdid_bank.rds"))
+
+  if (!is.null(sm)) {
+    p <- createSensitivityPlot(sm, NULL) +
+      labs(title = "HonestDiD smoothness (anti-market <- bank)")
+    save_figure(p, "fig_honestdid_smoothness", width = 8, height = 5)
+  }
+  if (!is.null(rm)) {
+    p <- createSensitivityPlot_relativeMagnitudes(rm, NULL) +
+      labs(title = "HonestDiD relative magnitudes (anti-market <- bank)")
+    save_figure(p, "fig_honestdid_relmag", width = 8, height = 5)
+  }
+
+  # Also run relative magnitudes on the C&S event study, if saved
+  if (!is.null(res$bank_cs_notyet)) {
+    es <- did::aggte(res$bank_cs_notyet$model, type = "dynamic", na.rm = TRUE)
+    keep <- which(es$egt >= -mx & es$egt <= mx)
+    bcs <- es$att.egt[keep]
+    scs <- if (!is.null(es$V_analytical) &&
+               nrow(es$V_analytical) == length(es$att.egt)) es$V_analytical[keep, keep]
+           else diag(es$se.egt[keep]^2)
+    pcs <- es$egt[keep]
+    rm_cs <- tryCatch(createSensitivityResults_relativeMagnitudes(betahat = bcs,
+              sigma = scs, numPrePeriods = sum(pcs < 0), numPostPeriods = sum(pcs >= 0),
+              Mbarvec = seq(0, 2, by = 0.5)), error = function(e) NULL)
+    if (!is.null(rm_cs)) {
+      p <- createSensitivityPlot_relativeMagnitudes(rm_cs, NULL) +
+        labs(title = "HonestDiD relative magnitudes (C&S)")
+      save_figure(p, "fig_honestdid_relmag_cs", width = 8, height = 5)
+    }
+  }
+}
+```
+
+## 4. Leave-one-out jackknife (drop each state)
+
+```{r loo}
+# County-level design => LOO over states (dropping single counties is too many/too slow).
+post_avg_twfe <- function(dat) {
+  m <- tryCatch(feols(as.formula(sprintf("%s ~ i(rel_b, ref=-1) | fips + year", Y)),
+                      dat, cluster = ~fips), error = function(e) NULL)
+  if (is.null(m)) return(NA_real_)
+  ct <- coef(m); mean(ct[grep("rel_b::[0-9]", names(ct))])
+}
+full_att <- post_avg_twfe(d)
+states <- sort(unique(d$state))
+loo <- rbindlist(lapply(states, function(s)
+  data.table(dropped = s, att = post_avg_twfe(d[state != s]))))
+fwrite(loo, file.path(DATA_PANELS, "loo_bank.csv"))
+message("Full ATT=", signif(full_att,3),
+        "; LOO range [", signif(min(loo$att,na.rm=TRUE),3), ", ",
+        signif(max(loo$att,na.rm=TRUE),3), "]")
+
+p_loo <- ggplot(loo[!is.na(att)], aes(att, reorder(dropped, att))) +
+  geom_vline(xintercept = full_att, linetype = "dashed", colour = "firebrick") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey50") +
+  geom_point(colour = "steelblue") +
+  labs(x = "Post-period ATT (drop one state)", y = NULL,
+       title = "Leave-one-out: anti-market <- bank distress") +
+  theme_minimal(base_size = 10)
+save_figure(p_loo, "fig_loo_bank", width = 7, height = 9)
+```
+
+## 5. Excess-pessimism residualization
+
+```{r excess}
+mc <- file.path(DATA_PANELS, "did_mortality.parquet")
+if (file.exists(mc)) {
+  dm <- as.data.table(read_parquet(mc))
+  ctrls <- intersect(c("mort", "mort_z"), names(dm))
+  if (length(ctrls)) {
+    f <- as.formula(paste("pessimistic_share ~", paste(ctrls, collapse = " + ")))
+    dm[, pess_excess := residuals(lm(f, dm, na.action = na.exclude))]
+    m_ex <- tryCatch(feols(pess_excess ~ spike | fips + year, dm, cluster = ~fips),
+                     error = function(e) { message("excess feols failed: ", conditionMessage(e)); NULL })
+    if (!is.null(m_ex)) {
+      saveRDS(m_ex, file.path(MODELS_DIR, "mortality_excess.rds"))
+      raw <- if (!is.null(res$mort_twfe)) signif(coef(res$mort_twfe)["spike"], 3) else NA
+      message("Excess-pessimism mortality coef = ", signif(coef(m_ex)["spike"], 3),
+              " (vs raw ", raw, ")")
+    }
+  }
+}
+```
+
+## 6. Alternative outcomes & weighting (bank design)
+
+```{r alt}
+safe <- function(expr) tryCatch(expr, error = function(e) NULL)
+k1 <- function(m) if (is.null(m)) NA else signif(coef(m)["rel_b::1"], 3)
+alt <- list(
+  meanp = safe(feols(anti_market_meanp    ~ i(rel_b, ref=-1) | fips + year, d, cluster=~fips)),
+  top   = safe(feols(anti_market_topshare ~ i(rel_b, ref=-1) | fips + year, d, cluster=~fips)),
+  wtd   = safe(feols(anti_market_share    ~ i(rel_b, ref=-1) | fips + year, d,
+                     weights = ~n_articles, cluster=~fips))
+)
+saveRDS(alt, file.path(MODELS_DIR, "bank_alt_outcomes.rds"))
+message("ATT(k=1): meanp=", k1(alt$meanp), " top=", k1(alt$top), " wtd=", k1(alt$wtd))
+```

@@ -1,0 +1,137 @@
+---
+title: "11 — Figures & tables"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(ggplot2); library(fixest)
+theme_set(theme_minimal(base_size = 12))
+BIAS <- c("anti_market","anti_foreign","make_work","pessimistic")
+BIAS_LAB <- c("Anti-market","Anti-foreign","Make-work","Pessimistic")
+```
+
+Builds the body + appendix figures and tables from saved panels/models and syncs them to
+Overleaf via `save_figure()` / `save_table()`. Run after steps 07, 09, 10.
+
+## Fig 1 — National trends in the four biases
+
+```{r fig-national}
+nat <- fread(file.path(DATA_PANELS, "trend_national.csv"))
+long <- melt(nat, id.vars = "year",
+             measure.vars = paste0(BIAS, "_share"),
+             variable.name = "bias", value.name = "share")
+long[, bias := factor(bias, paste0(BIAS, "_share"), BIAS_LAB)]
+p1 <- ggplot(long, aes(year, share, colour = bias)) +
+  geom_line(linewidth = 0.7) +
+  labs(x = NULL, y = "Share of articles endorsing", colour = NULL,
+       title = "Four economic biases in the American press") +
+  theme(legend.position = "bottom")
+save_figure(p1, "fig_national_bias_trend", width = 8, height = 5)
+p1
+```
+
+## Fig 2 — Regional trends (small multiples)
+
+```{r fig-regional}
+reg <- fread(file.path(DATA_PANELS, "trend_regional.csv"))
+rl <- melt(reg, id.vars = c("region","year"),
+           measure.vars = paste0(BIAS, "_share"),
+           variable.name = "bias", value.name = "share")
+rl[, bias := factor(bias, paste0(BIAS, "_share"), BIAS_LAB)]
+p2 <- ggplot(rl[!is.na(region) & region != "Unknown"],
+             aes(year, share, colour = bias)) +
+  geom_line() + facet_wrap(~region) +
+  labs(x = NULL, y = "Share endorsing", colour = NULL) +
+  theme(legend.position = "bottom")
+save_figure(p2, "fig_regional_bias_trend", width = 9, height = 6)
+p2
+```
+
+## Fig 3 — Event studies (one panel per design)
+
+```{r fig-eventstudy}
+res <- readRDS(file.path(MODELS_DIR, "did_results.rds"))
+es_df <- function(m, label) {
+  if (is.null(m)) return(NULL)
+  if (is.list(m) && !is.null(m$est.att)) {          # did_wrapper result -> use $est.att
+    e <- as.data.table(m$est.att)
+    if (!nrow(e)) return(NULL)
+    return(data.table(design = label, k = e$period, est = e$ATT, se = e$S.E.))
+  }
+  ct <- coef(m); se <- sqrt(diag(vcov(m)))            # fixest event study: i(k, ...) coefs
+  idx <- grep("^k::", names(ct)); if (!length(idx)) return(NULL)
+  data.table(design = label,
+             k = as.integer(sub("^k::(-?\\d+).*$", "\\1", names(ct)[idx])),
+             est = unname(ct[idx]), se = unname(se[idx]))
+}
+ev <- rbindlist(list(
+  es_df(res$bank_twfe, "Anti-market <- bank distress"),
+  es_df(res$wwi_exp,   "Anti-foreign <- WWI x German-born"),
+  es_df(res$immigration_1924_exp, "Anti-foreign <- 1924 Act x foreign-born")
+), fill = TRUE)
+if (nrow(ev)) {
+  p3 <- ggplot(ev, aes(k, est)) +
+    geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+    geom_vline(xintercept = -0.5, linetype = 3, colour = "grey70") +
+    geom_pointrange(aes(ymin = est - 1.96*se, ymax = est + 1.96*se)) +
+    facet_wrap(~design, scales = "free_y") +
+    labs(x = "Years relative to shock", y = "Effect on bias share")
+  save_figure(p3, "fig_event_studies", width = 10, height = 4)
+  p3
+}
+```
+
+## Fig 4 — County map of a bias (usmap)
+
+```{r fig-map}
+py <- as.data.table(read_parquet(file.path(DATA_PANELS, "panel_county_year.parquet")))
+cm <- py[year %in% 1925:1935, .(value = mean(anti_market_share, na.rm = TRUE)), by = fips]
+p4 <- usmap::plot_usmap(data = cm, values = "value", regions = "counties", linewidth = 0.05) +
+  ggplot2::scale_fill_continuous(name = "Anti-market\nshare", low = "white", high = "firebrick",
+                                 na.value = "grey92") +
+  ggplot2::labs(title = "Anti-market framing by county, 1925–1935") +
+  ggplot2::theme(legend.position = "right")
+save_figure(p4, "fig_map_anti_market", width = 9, height = 6)
+p4
+```
+
+## Fig 5 — Leave-one-out forest (bank design)
+
+The leave-one-out forest plot (`fig_loo_bank`) is produced directly in
+`rmd/10_robustness.Rmd` §4, which holds the full-sample reference ATT in memory. No
+duplicate here.
+
+## Table 1 — Headline ATT by design (LaTeX)
+
+```{r tab-att}
+# Read the headline ATT table assembled in step 09 (it already handles each estimator
+# type correctly) and format it as booktabs LaTeX. Avoids re-deriving from mixed objects.
+att_path <- file.path(TABLES_DIR, "att_headline.csv")
+if (file.exists(att_path) && file.size(att_path) > 1) {
+  tab <- fread(att_path)
+  if (nrow(tab)) {
+    fmt <- data.table(
+      Design = gsub(" <- ", " --- ", tab$Design, fixed = TRUE),   # em-dash, LaTeX-safe
+      ATT = sprintf("%.4f", tab$ATT), SE = sprintf("(%.4f)", tab$SE))
+    body <- paste(apply(fmt, 1, function(r)
+      paste(r[["Design"]], r[["ATT"]], r[["SE"]], sep = " & ")), collapse = " \\\\\n")
+    tex <- paste0(
+      "\\begin{tabular}{lcc}\n\\toprule\n",
+      "Design & ATT & (SE) \\\\\n\\midrule\n", body, " \\\\\n",
+      "\\bottomrule\n\\end{tabular}\n")
+    save_table(tex, "table_att_headline")
+    cat(tex)
+  }
+} else message("No att_headline.csv yet (run step 09 first).")
+```
+
+```{r done}
+message("Figures -> ", FIGURES_DIR, "  and  ", OVERLEAF_FIGURES)
+message("Tables  -> ", TABLES_DIR,  "  and  ", OVERLEAF_TABLES)
+```

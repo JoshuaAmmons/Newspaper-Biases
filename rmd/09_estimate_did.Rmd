@@ -1,0 +1,139 @@
+---
+title: "09 — Estimate causal effects (DiD / event studies)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+source(file.path(PROJECT_ROOT, "R", "did_wrapper.R"))   # unified multi-estimator interface
+library(arrow); library(data.table); library(fixest); library(did)
+```
+
+Estimates the effect of each shock on its bias outcome. **Primary outcome:** the
+share-above-threshold (`<bias>_share`); mean-prob and top-share are run in robustness (step 10).
+
+Estimator choice by design (docs/PROJECT_PLAN.md §5):
+
+* **Staggered, absorbing** (bank distress, mechanization) → all four estimators via
+  `did_wrapper()`: TWFE, Sun–Abraham (`iw`), Callaway–Sant'Anna (`cs_notyet`), de
+  Chaisemartin–D'Haultfœuille (`didm`). This is the headline, and reporting all four guards
+  against the known TWFE bias under heterogeneous timing.
+* **Non-absorbing shocks** (mortality spike, drought) → contemporaneous TWFE with two-way FE.
+* **Continuous exposure × national event** (WWI, 1924 Act) → event study interacting
+  relative-time dummies with the pre-period county exposure share.
+
+```{r prep}
+# did_wrapper needs an integer unit id and integer time id.
+load_design <- function(name) {
+  fn <- file.path(DATA_PANELS, paste0("did_", name, ".parquet"))
+  if (!file.exists(fn)) { message("missing ", fn); return(NULL) }
+  d <- as.data.table(read_parquet(fn))
+  d[, fips_int := as.integer(factor(fips))]
+  d[]
+}
+res <- list()
+# Wrap an estimator so one degenerate/sparse design can't abort the whole step.
+safe <- function(expr) tryCatch(expr,
+  error = function(e) { message("  estimator failed: ", conditionMessage(e)); NULL })
+```
+
+## Design 1 — Anti-market ← bank distress (all four estimators)
+
+```{r d1}
+d <- load_design("bank_distress")
+if (!is.null(d)) {
+  y <- "anti_market_share"
+  d[, post := as.integer(!is.na(treat_year) & year >= treat_year)]   # 0/1 treatment
+  for (m in c("twfe", "iw", "cs_notyet", "didm")) {
+    res[[paste0("bank_", m)]] <- tryCatch(
+      did_wrapper(d[!is.na(get(y))], Y = y, D = "post",
+                  index = c("fips_int", "year"), method = m,
+                  didm.effects = 6, didm.placebo = 4),
+      error = function(e) { message(m, " failed: ", e$message); NULL })
+  }
+  for (m in c("twfe","iw","cs_notyet","didm")) {
+    r <- res[[paste0("bank_", m)]]
+    if (!is.null(r)) cat(sprintf("  bank %-9s ATT.avg = %s (SE %s)\n", m,
+        signif(r$est.avg$ATT.avg, 3), signif(r$est.avg$S.E., 3)))
+  }
+}
+```
+
+## Design 4 — Make-work ← mechanization (staggered: TWFE + C&S)
+
+```{r d4}
+d <- load_design("mechanization")
+if (!is.null(d)) {
+  d[, treated := as.integer(high_adopt == 1 & post == 1)]   # treated = high-adopt in post
+  for (m in c("twfe", "cs_notyet")) {
+    res[[paste0("mech_", m)]] <- tryCatch(
+      did_wrapper(d[!is.na(make_work_share)], Y = "make_work_share", D = "treated",
+                  index = c("fips_int", "year"), method = m),
+      error = function(e) { message(m, " failed: ", e$message); NULL })
+  }
+}
+```
+
+## Design 2 — Pessimistic ← mortality (annual) & drought (monthly), non-absorbing
+
+```{r d2}
+d <- load_design("mortality")
+if (!is.null(d))
+  res$mort_twfe <- safe(feols(pessimistic_share ~ spike | fips + year, d, cluster = ~fips))
+
+dc <- file.path(DATA_PANELS, "did_climate.parquet")
+if (file.exists(dc)) {
+  d <- as.data.table(read_parquet(dc))
+  # county-month DiD: drought effect; county + year-month FE; county-clustered
+  res$clim_twfe <- safe(feols(pessimistic_share ~ drought | fips + ym, d, cluster = ~fips))
+}
+for (nm in c("mort_twfe","clim_twfe"))
+  if (!is.null(res[[nm]])) { cat("\n", nm, ":\n"); print(summary(res[[nm]])) }
+```
+
+## Design 3 — Anti-foreign ← WWI / 1924 exposure (continuous interaction)
+
+```{r d3}
+for (nm in c("wwi", "immigration_1924")) {
+  fn <- file.path(DATA_PANELS, paste0("did_", nm, "_exposure.parquet"))
+  if (!file.exists(fn)) next
+  d <- as.data.table(read_parquet(fn))
+  d[, k := pmin(pmax(rel_year, -6), 6)]
+  res[[paste0(nm, "_exp")]] <- safe(
+    feols(anti_foreign_share ~ i(k, exposure, ref = -1) | fips + year, d, cluster = ~fips))
+  if (!is.null(res[[paste0(nm, "_exp")]])) {
+    cat("\n", nm, "exposure event study:\n"); print(summary(res[[paste0(nm,"_exp")]]))
+  }
+}
+```
+
+## Save all estimates + headline ATT table
+
+```{r save}
+saveRDS(res, file.path(MODELS_DIR, "did_results.rds"))
+
+# Headline ATT per design. did_wrapper objects expose $est.avg uniformly; fixest objects
+# expose a single coefficient of interest.
+row_wrap  <- function(r, lab) if (is.null(r)) NULL else
+  data.table(Design = lab, ATT = r$est.avg$ATT.avg, SE = r$est.avg$S.E., p = r$est.avg$p.value)
+row_feols <- function(m, lab, cf) {
+  if (is.null(m) || !cf %in% names(coef(m))) return(NULL)
+  b <- coef(m)[cf]; s <- sqrt(diag(vcov(m)))[cf]
+  data.table(Design = lab, ATT = unname(b), SE = unname(s), p = 2*pnorm(-abs(b/s)))
+}
+tab <- rbindlist(list(
+  row_wrap(res$bank_cs_notyet, "Anti-market <- bank distress (C&S)"),
+  row_wrap(res$bank_didm,      "Anti-market <- bank distress (dCDH)"),
+  row_wrap(res$mech_cs_notyet, "Make-work <- mechanization (C&S)"),
+  row_feols(res$mort_twfe, "Pessimistic <- mortality spike", "spike"),
+  row_feols(res$clim_twfe, "Pessimistic <- drought (month)", "drought")
+), fill = TRUE)
+fwrite(tab, file.path(TABLES_DIR, "att_headline.csv"))
+print(tab)
+message("Saved did_results.rds and att_headline.csv (formatted LaTeX in step 11).")
+```

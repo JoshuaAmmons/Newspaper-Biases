@@ -1,0 +1,56 @@
+---
+title: "00 — Environment setup & checks"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+```
+
+Confirms the R + Python environment before running the pipeline. If anything here
+fails, fix it before proceeding (see `install_packages.R` and `requirements.txt`).
+
+## R packages
+
+```{r r-packages}
+needed <- c("data.table", "arrow", "dplyr", "tidyr", "stringi", "readr",
+            "lubridate", "jsonlite", "httr2", "ggplot2", "patchwork",
+            "fixest", "did", "fect", "usmap", "sf")
+status <- sapply(needed, function(p) requireNamespace(p, quietly = TRUE))
+print(data.frame(package = needed, installed = status))
+missing <- needed[!status]
+if (length(missing)) {
+  warning("Missing R packages: ", paste(missing, collapse = ", "),
+          " — run install_packages.R")
+}
+
+# GitHub-only robustness packages (optional but used in step 10)
+for (p in c("DIDmultiplegt", "DIDmultiplegtDYN", "HonestDiD")) {
+  message(p, ": ", if (requireNamespace(p, quietly = TRUE)) "ok" else "MISSING (step 10)")
+}
+```
+
+## Python + GPU
+
+```{r python-check}
+exit_code <- system2(PYTHON_EXE,
+                     args = shQuote(file.path(PROJECT_ROOT, "python", "00_setup_check.py")),
+                     stdout = "", stderr = "", wait = TRUE)
+if (exit_code != 0) warning("python/00_setup_check.py exited ", exit_code)
+```
+
+## Directory tree
+
+```{r dirs}
+for (d in c(DATA_RAW, DATA_PARQUET, DATA_PANELS, MODELS_DIR, FIGURES_DIR,
+            TABLES_DIR, OUTPUT_HTML, OUTPUT_LOGS)) {
+  cat(sprintf("  %-14s %s\n", if (dir.exists(d)) "[ok]" else "[missing]", d))
+}
+cat("\nOverleaf targets (edit _config.R if these are wrong):\n")
+cat("  Figures:", OVERLEAF_FIGURES, "\n  Tables: ", OVERLEAF_TABLES, "\n")
+```

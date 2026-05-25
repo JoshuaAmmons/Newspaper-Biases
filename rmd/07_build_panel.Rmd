@@ -1,0 +1,90 @@
+---
+title: "07 — Build county-period bias panel"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(dplyr); library(lubridate)
+BIAS <- c("anti_market", "anti_foreign", "make_work", "pessimistic")
+```
+
+Aggregates calibrated article scores to **county × year** (default) and **county × month**
+(for the climate design) panels. Three aggregation rules per bias are produced and compared
+in step 09: mean calibrated probability, share-above-threshold (primary), and top-decile share.
+
+## Join scores to publication county
+
+```{r join}
+xwalk <- read_parquet(file.path(DATA_PANELS, "xwalk_lccn_county.parquet")) |> as.data.table()
+join_key <- if ("lccn" %in% names(xwalk)) "lccn" else "newspaper_name"
+xw <- unique(xwalk[, .(key = get(join_key), fips, state, region)])
+
+scored <- open_dataset(list.files(SCORED_DIR, pattern = "^scored_.*\\.parquet$",
+                                  full.names = TRUE))
+have <- names(scored$schema)
+sel <- intersect(c("article_id", join_key, "date", "year", "page",
+                   paste0("p_", BIAS, "_cal"), paste0("endorse_", BIAS)), have)
+art <- scored |> select(all_of(sel)) |> collect() |> as.data.table()
+art <- merge(art, xw, by.x = join_key, by.y = "key", all.x = TRUE)
+art <- art[!is.na(fips)]
+if (!"year" %in% names(art) && "date" %in% names(art)) art[, year := year(as.Date(date))]
+art[, month := if ("date" %in% names(art)) month(as.Date(date)) else NA_integer_]
+message("Scored+geolocated articles: ", nrow(art))
+```
+
+## Aggregation helper
+
+```{r agg-fn}
+agg_panel <- function(dt, by_cols) {
+  out <- dt[, .(n_articles = .N), by = by_cols]
+  for (b in BIAS) {
+    pcol <- paste0("p_", b, "_cal"); ecol <- paste0("endorse_", b)
+    thr_top <- quantile(dt[[pcol]], 0.90, na.rm = TRUE)
+    a <- dt[, .(
+      mean_p   = mean(get(pcol), na.rm = TRUE),       # rule 1: mean prob
+      share    = mean(get(ecol), na.rm = TRUE),       # rule 2: share above threshold (PRIMARY)
+      top_share = mean(get(pcol) >= thr_top, na.rm = TRUE)  # rule 3: top-decile share
+    ), by = by_cols]
+    setnames(a, c("mean_p","share","top_share"),
+             paste0(b, c("_meanp","_share","_topshare")))
+    out <- merge(out, a, by = by_cols, all.x = TRUE)
+  }
+  out
+}
+```
+
+## County-year and county-month panels
+
+```{r build}
+panel_year <- agg_panel(art, c("fips", "state", "region", "year"))
+setorder(panel_year, fips, year)
+write_parquet(panel_year, file.path(DATA_PANELS, "panel_county_year.parquet"))
+message("county-year panel: ", nrow(panel_year), " rows, ",
+        uniqueN(panel_year$fips), " counties")
+
+if (!all(is.na(art$month))) {
+  panel_month <- agg_panel(art[!is.na(month)], c("fips", "state", "region", "year", "month"))
+  panel_month[, ym := year * 100L + month]
+  setorder(panel_month, fips, ym)
+  write_parquet(panel_month, file.path(DATA_PANELS, "panel_county_month.parquet"))
+  message("county-month panel: ", nrow(panel_month), " rows")
+}
+```
+
+## National & regional descriptive trends (paper figures 1–2)
+
+```{r trends}
+nat <- panel_year[, lapply(.SD, weighted.mean, w = n_articles, na.rm = TRUE),
+                  .SDcols = patterns("_share$"), by = year]
+fwrite(nat, file.path(DATA_PANELS, "trend_national.csv"))
+reg <- panel_year[, lapply(.SD, weighted.mean, w = n_articles, na.rm = TRUE),
+                  .SDcols = patterns("_share$"), by = .(region, year)]
+fwrite(reg, file.path(DATA_PANELS, "trend_regional.csv"))
+print(head(nat))
+```

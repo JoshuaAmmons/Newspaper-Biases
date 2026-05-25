@@ -1,0 +1,172 @@
+---
+title: "08 — Build shock datasets & merge to panel"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(dplyr)
+```
+
+Builds each shock (one per bias) from the external extracts in `data_raw/` (see
+docs/DATA_SOURCES.md) and merges to the bias panel, producing a DiD-ready table per design
+in `data_panels/did_<shock>.parquet`. Column names in the raw NHGIS/NOAA/IPUMS files depend
+on the extract you built — each block has a `TODO(human)` mapping step; the **treatment
+construction** logic is concrete.
+
+```{r load-panels}
+panel_year  <- read_parquet(file.path(DATA_PANELS, "panel_county_year.parquet")) |> as.data.table()
+panel_month <- if (file.exists(file.path(DATA_PANELS, "panel_county_month.parquet")))
+  as.data.table(read_parquet(file.path(DATA_PANELS, "panel_county_month.parquet"))) else NULL
+```
+
+## Design 1 — Anti-market: county bank distress (1920–1936)
+
+```{r bank}
+raw <- SHOCKS$bank_distress$raw_dir
+f <- list.files(raw, pattern = "\\.csv$", full.names = TRUE)
+if (length(f)) {
+  bd <- fread(f[1])
+  # TODO(human): map NHGIS columns -> fips, year, deposits. Example mapping:
+  #   bd[, fips := fips5(STATEA, COUNTYA)]; bd[, deposits := <deposit column>]
+  setnames(bd, old = c("STATEA","COUNTYA"), new = c("st","cty"), skip_absent = TRUE)
+  if (all(c("st","cty") %in% names(bd))) bd[, fips := fips5(st, cty)]
+  # deposits column name varies by extract; set it here:
+  dep_col <- grep("deposit", names(bd), ignore.case = TRUE, value = TRUE)[1]
+  stopifnot(!is.na(dep_col)); setnames(bd, dep_col, "deposits")
+  bd <- bd[, .(fips, year = as.integer(year), deposits = as.numeric(deposits))]
+
+  setorder(bd, fips, year)
+  bd[, dlog := c(NA, diff(log(deposits))), by = fips]            # YoY log change
+  # binary staggered treatment: first year a county's decline is in the worst decile
+  bd[, treat_year := {
+      thr <- quantile(dlog, 0.10, na.rm = TRUE)                  # 10th pctile (sharp falls)
+      yrs <- year[which(dlog <= thr)]
+      if (length(yrs)) min(yrs) else NA_integer_
+  }, by = fips]
+  bank <- merge(panel_year, unique(bd[, .(fips, treat_year)]), by = "fips")
+  bank <- merge(bank, bd[, .(fips, year, dlog)], by = c("fips","year"), all.x = TRUE)
+  bank[, post := as.integer(!is.na(treat_year) & year >= treat_year)]
+  bank[, rel_year := ifelse(is.na(treat_year), NA_integer_, year - treat_year)]
+  write_parquet(bank, file.path(DATA_PANELS, "did_bank_distress.parquet"))
+  message("did_bank_distress: ", nrow(bank), " county-years; treated counties: ",
+          uniqueN(bank[!is.na(treat_year)]$fips))
+} else message("TODO(human): drop the NHGIS FDIC deposit extract in ", raw)
+```
+
+## Design 2 — Pessimistic: county climate (monthly) + mortality (annual)
+
+```{r climate}
+raw <- SHOCKS$climate$raw_dir
+f <- list.files(raw, pattern = "\\.(csv|txt)$", full.names = TRUE)
+if (length(f) && !is.null(panel_month)) {
+  cl <- rbindlist(lapply(f, fread), fill = TRUE)
+  # TODO(human): map NOAA nClimDiv columns -> fips, year, month, tavg, precip, pdsi.
+  # Drought treatment: PDSI <= -3 (severe), or z-scored precip/temp anomaly.
+  setnames(cl, old = c("FIPS","YEAR","MONTH","PDSI"),
+           new = c("fips","year","month","pdsi"), skip_absent = TRUE)
+  cl[, fips := formatC(as.integer(fips), width = 5, flag = "0")]   # zero-pad to 5-digit FIPS
+  # z-score each variable vs the county's own monthly climatology
+  cl[, pdsi_z := zscore(pdsi), by = .(fips, month)]
+  cl[, drought := as.integer(pdsi <= -3 | pdsi_z <= -1.5)]
+  clim <- merge(panel_month, cl[, .(fips, year, month, pdsi, pdsi_z, drought)],
+                by = c("fips","year","month"), all.x = TRUE)
+  # staggered onset of first drought month per county (for event study)
+  clim[, ym := year*100L + month]
+  clim[, treat_ym := { yy <- ym[which(drought == 1)]; if (length(yy)) min(yy) else NA }, by = fips]
+  write_parquet(clim, file.path(DATA_PANELS, "did_climate.parquet"))
+  message("did_climate: ", nrow(clim), " county-months")
+} else message("TODO(human): drop NOAA nClimDiv county files in ", raw,
+               " (and ensure county-month panel exists)")
+```
+
+```{r mortality}
+raw <- SHOCKS$mortality$raw_dir
+f <- list.files(raw, pattern = "\\.csv$", full.names = TRUE)
+if (length(f)) {
+  mv <- fread(f[1])
+  # TODO(human): map NHGIS vital-stats columns -> fips, year, deaths, population.
+  setnames(mv, old = c("STATEA","COUNTYA"), new = c("st","cty"), skip_absent = TRUE)
+  if (all(c("st","cty") %in% names(mv))) mv[, fips := fips5(st, cty)]
+  death_col <- grep("death", names(mv), ignore.case = TRUE, value = TRUE)[1]
+  pop_col   <- grep("pop",   names(mv), ignore.case = TRUE, value = TRUE)[1]
+  setnames(mv, c(death_col, pop_col), c("deaths","pop"))
+  mv <- mv[, .(fips, year = as.integer(year), mort = as.numeric(deaths)/as.numeric(pop))]
+  mv[, mort_z := zscore(mort), by = fips]
+  mv[, spike := as.integer(mort_z >= 2)]                       # mortality spike
+  mort <- merge(panel_year, mv, by = c("fips","year"), all.x = TRUE)
+  write_parquet(mort, file.path(DATA_PANELS, "did_mortality.parquet"))
+  message("did_mortality: ", nrow(mort), " county-years")
+} else message("TODO(human): drop NHGIS vital-stats extract in ", raw)
+```
+
+## Design 3 — Anti-foreign: national event × pre-period county exposure
+
+```{r exposure}
+raw <- SHOCKS$wwi_exposure$raw_dir
+f <- list.files(raw, pattern = "\\.csv$", full.names = TRUE)
+if (length(f)) {
+  ex <- fread(f[1])
+  # TODO(human): build from IPUMS Full Count / NHGIS -> fips + share columns.
+  #   german_born_1910 (WWI design); foreign_born_1920 or se_european_1920 (1924 design)
+  setnames(ex, old = c("STATEA","COUNTYA"), new = c("st","cty"), skip_absent = TRUE)
+  if (all(c("st","cty") %in% names(ex))) ex[, fips := fips5(st, cty)]
+  ex <- ex[, .(fips,
+               exp_wwi  = as.numeric(get(grep("german", names(ex), ignore.case=TRUE, value=TRUE)[1])),
+               exp_1924 = as.numeric(get(grep("foreign", names(ex), ignore.case=TRUE, value=TRUE)[1])))]
+
+  build_exposure <- function(event_year, exp_col, outname) {
+    d <- merge(panel_year, ex[, .(fips, exposure = get(exp_col))], by = "fips")
+    d[, post := as.integer(year >= event_year)]
+    d[, rel_year := year - event_year]
+    d[, treat_interact := post * exposure]
+    write_parquet(d, file.path(DATA_PANELS, outname))
+    message(outname, ": ", nrow(d), " county-years; mean exposure ",
+            round(mean(d$exposure, na.rm = TRUE), 3))
+  }
+  build_exposure(year(EVENTS$wwi_entry),        "exp_wwi",  "did_wwi_exposure.parquet")
+  build_exposure(year(EVENTS$immigration_1924), "exp_1924", "did_immigration_1924_exposure.parquet")
+} else message("TODO(human): drop county nativity-share extract in ", raw)
+```
+
+## Design 4 — Make-work: county farm mechanization (1925 → 1935)
+
+```{r mechanization}
+raw <- SHOCKS$mechanization$raw_dir
+f <- list.files(raw, pattern = "\\.csv$", full.names = TRUE)
+if (length(f)) {
+  ag <- rbindlist(lapply(f, fread), fill = TRUE)
+  # TODO(human): map NHGIS AgCensus columns -> fips, census_year, tractors, farms.
+  setnames(ag, old = c("STATEA","COUNTYA"), new = c("st","cty"), skip_absent = TRUE)
+  if (all(c("st","cty") %in% names(ag))) ag[, fips := fips5(st, cty)]
+  tractor_col <- grep("tractor", names(ag), ignore.case = TRUE, value = TRUE)[1]
+  farm_col    <- grep("farms?", names(ag), ignore.case = TRUE, value = TRUE)[1]
+  setnames(ag, c(tractor_col, farm_col), c("tractors","farms"))
+  ag <- ag[census_year %in% c(1925,1935), .(fips, census_year,
+                                             mech = as.numeric(tractors)/as.numeric(farms))]
+  w <- dcast(ag, fips ~ census_year, value.var = "mech")
+  setnames(w, c("1925","1935"), c("mech_1925","mech_1935"), skip_absent = TRUE)
+  w[, dmech := mech_1935 - mech_1925]
+  w[, high_adopt := as.integer(dmech >= quantile(dmech, 0.75, na.rm = TRUE))]  # top quartile
+  mech <- merge(panel_year[year %in% 1920:1940], w[, .(fips, high_adopt, dmech)], by = "fips")
+  mech[, post := as.integer(year >= 1930)]   # mid-point of the intercensal window
+  write_parquet(mech, file.path(DATA_PANELS, "did_mechanization.parquet"))
+  message("did_mechanization: ", nrow(mech), " county-years; high-adopt counties: ",
+          uniqueN(mech[high_adopt==1]$fips))
+} else message("TODO(human): drop NHGIS AgCensus 1925 & 1935 extract in ", raw)
+```
+
+## Merge diagnostics
+
+```{r diag}
+for (fn in list.files(DATA_PANELS, pattern = "^did_.*\\.parquet$", full.names = TRUE)) {
+  d <- read_parquet(fn)
+  cat(sprintf("  %-36s rows=%6d counties=%5d\n",
+              basename(fn), nrow(d), length(unique(d$fips))))
+}
+```

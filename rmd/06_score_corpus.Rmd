@@ -1,0 +1,91 @@
+---
+title: "06 — Train classifiers, score corpus, calibrate"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+PROJECT_ROOT <- Sys.getenv("CAPLAN_ROOT")
+if (PROJECT_ROOT == "") PROJECT_ROOT <- rprojroot::find_root(rprojroot::has_file("_config.R"))
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+source(file.path(PROJECT_ROOT, "_config.R"))
+source(file.path(PROJECT_ROOT, "R", "helpers.R"))
+library(arrow); library(data.table); library(dplyr)
+BIAS <- c("anti_market", "anti_foreign", "make_work", "pessimistic")
+```
+
+Trains the staged RoBERTa classifiers, runs batched inference over the whole corpus, then
+fits **isotonic calibration** and per-bias **thresholds** on the dev set so the aggregated
+shares in step 07 are meaningful. (Python does training + raw scoring; R does calibration.)
+
+## 1. Train (relevance gate + 4 stance heads)
+
+```{r train}
+if (!dir.exists(STANCE_MODEL_DIR)) {
+  exit <- system2(PYTHON_EXE, args = c(
+    shQuote(file.path(PROJECT_ROOT, "python", "train_classifiers.py")),
+    "--stage", "both", "--base", "roberta-base", "--epochs", "4"
+  ), stdout = "", stderr = "", wait = TRUE)
+  if (exit != 0) stop("train_classifiers.py exited ", exit)
+}
+cat(readLines(file.path(MODELS_DIR, "test_metrics.json")), sep = "\n")
+```
+
+## 2. Fit isotonic calibrators + thresholds (on dev predictions)
+
+```{r calibrate}
+dev <- as.data.table(read_parquet(file.path(MODELS_DIR, "dev_pred_stance.parquet")))
+calibrators <- list(); thresholds <- numeric()
+for (b in BIAS) {
+  pcol <- paste0("p_", b); ycol <- paste0("y_", b)
+  calibrators[[b]] <- fit_isotonic(dev[[pcol]], dev[[ycol]])
+  # threshold = value maximizing F1 on dev (swap for fixed-precision if preferred)
+  grid <- seq(0.05, 0.95, by = 0.025)
+  f1 <- sapply(grid, function(th) {
+    pred <- as.integer(calibrators[[b]](dev[[pcol]]) >= th)
+    tp <- sum(pred == 1 & dev[[ycol]] == 1); fp <- sum(pred == 1 & dev[[ycol]] == 0)
+    fn <- sum(pred == 0 & dev[[ycol]] == 1)
+    if (tp == 0) return(0)
+    p <- tp/(tp+fp); r <- tp/(tp+fn); 2*p*r/(p+r)
+  })
+  thresholds[b] <- grid[which.max(f1)]
+  message(sprintf("  %-12s threshold=%.3f  bestF1=%.3f", b, thresholds[b], max(f1)))
+}
+saveRDS(list(calibrators = calibrators, thresholds = thresholds), CALIBRATORS_RDS)
+```
+
+## 3. Score the corpus (raw probabilities)
+
+```{r score}
+if (length(list.files(SCORED_DIR, pattern = "\\.parquet$")) == 0) {
+  exit <- system2(PYTHON_EXE, args = c(
+    shQuote(file.path(PROJECT_ROOT, "python", "score_corpus.py")),
+    "--in",  shQuote(file.path(DATA_PARQUET, "articles_cleaned")),
+    "--out", shQuote(SCORED_DIR), "--gate", "0.5", "--batch-size", "64"
+  ), stdout = "", stderr = "", wait = TRUE)
+  if (exit != 0) stop("score_corpus.py exited ", exit)
+}
+```
+
+## 4. Apply calibration -> calibrated probabilities + endorse flags
+
+```{r apply-cal}
+cal <- readRDS(CALIBRATORS_RDS)
+scored_files <- list.files(SCORED_DIR, pattern = "^scored_.*\\.parquet$", full.names = TRUE)
+for (sf in scored_files) {
+  dt <- as.data.table(read_parquet(sf))
+  if (paste0("p_", BIAS[1], "_cal") %in% names(dt)) next   # already calibrated
+  for (b in BIAS) {
+    raw <- dt[[paste0("p_", b, "_raw")]]
+    dt[, (paste0("p_", b, "_cal"))    := cal$calibrators[[b]](raw)]
+    dt[, (paste0("endorse_", b)) := as.integer(get(paste0("p_", b, "_cal")) >= cal$thresholds[b])]
+  }
+  write_parquet(dt, sf)
+}
+message("Calibrated ", length(scored_files), " scored files.")
+
+# quick corpus-level sanity check
+ds <- open_dataset(scored_files)
+ds |> summarise(across(starts_with("endorse_"), ~mean(.x, na.rm = TRUE))) |>
+  collect() |> print()
+```

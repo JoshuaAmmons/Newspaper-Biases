@@ -1,0 +1,49 @@
+# --- Data: large, re-downloadable; never commit ---
+data_raw/
+data_parquet/
+data_panels/
+models/
+figures/
+tables/
+output/
+
+# Corpus & derived data files (raw corpus lives outside the repo at C:\Users\jdamm\Caplan)
+*.parquet
+*.tar.gz
+*.feather
+*.arrow
+*.rds
+
+# --- Secrets / API keys ---
+.env
+.env.*
+*.env
+*.env.txt
+Keys.env*
+keys.*
+*secret*
+.Renviron
+*.key
+
+# --- R ---
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- Editor / OS / tooling ---
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
