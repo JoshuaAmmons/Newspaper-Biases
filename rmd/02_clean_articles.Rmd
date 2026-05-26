@@ -41,40 +41,65 @@ dir.create(cleaned_dir, showWarnings = FALSE, recursive = TRUE)
 MIN_WORDS   <- 25      # drop fragments
 MAX_NONALPHA <- 0.40   # drop badly OCR'd scans
 
-for (rf in raw_files) {
+# Optional year scope (CAPLAN_CLEAN_YEARS, e.g. "1895-1945"); default = all ingested years.
+.sel <- Sys.getenv("CAPLAN_CLEAN_YEARS")
+if (nzchar(.sel)) {
+  .keep <- unlist(lapply(strsplit(.sel, ",")[[1]], function(p)
+    if (grepl("-", p)) do.call(seq, as.list(as.integer(strsplit(p, "-")[[1]]))) else as.integer(p)))
+  .yrs <- as.integer(gsub(".*articles_(\\d{4})\\.parquet", "\\1", raw_files))
+  .pick <- .yrs %in% .keep
+  raw_files <- raw_files[.pick]; .yrs <- .yrs[.pick]
+  raw_files <- raw_files[order(match(.yrs, .keep))]   # honor CAPLAN_CLEAN_YEARS order (e.g. window-first)
+}
+message("cleaning ", length(raw_files), " year files (parallel)")
+
+# Clean one year: same logic as the validated pipeline (normalize, quality-filter,
+# exact-dup drop), with an atomic write so a killed worker can't leave a partial file.
+clean_one <- function(rf) {
   yr <- as.integer(gsub(".*articles_(\\d{4})\\.parquet", "\\1", rf))
   outdir  <- file.path(cleaned_dir, paste0("year=", yr))
   outpath <- file.path(outdir, "part-0.parquet")
-  if (file.exists(outpath)) { message("Year ", yr, " already cleaned, skip"); next }
-
-  dt <- as.data.table(read_parquet(rf))
-  setnames(dt, TEXT_COL, "article", skip_absent = TRUE)
-
-  # stable id
-  if (!ID_COL %in% names(dt)) {
-    dt[, article_id := paste0(yr, "_", .I)]
-  } else if (ID_COL != "article_id") {
-    setnames(dt, ID_COL, "article_id")
-  }
-
-  # normalize whitespace; compute quality metrics
-  dt[, article := stringi::stri_replace_all_regex(article, "\\s+", " ")]
-  dt[, article := trimws(article)]
-  dt[, word_count   := count_words(article)]
-  dt[, ocr_nonalpha := share_nonalpha(article)]
-  dt[, year := yr]
-
-  before <- nrow(dt)
-  dt <- dt[word_count >= MIN_WORDS & (is.na(ocr_nonalpha) | ocr_nonalpha <= MAX_NONALPHA)]
-  # exact-duplicate text drop (syndicated boilerplate handled separately later)
-  dt <- unique(dt, by = "article")
-
-  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
-  write_parquet(dt, outpath)
-  message(sprintf("Year %d: %d -> %d articles kept (%.1f%%)",
-                  yr, before, nrow(dt), 100 * nrow(dt) / before))
-  rm(dt); gc()
+  if (file.exists(outpath)) return(paste0(yr, ": skip"))
+  tryCatch({                                            # an OOM on one year must not abort the cluster
+    dt <- as.data.table(arrow::read_parquet(rf))
+    if (TEXT_COL %in% names(dt) && TEXT_COL != "article") setnames(dt, TEXT_COL, "article")
+    if (!"article_id" %in% names(dt)) dt[, article_id := paste0(yr, "_", .I)]
+    dt[, article := trimws(stringi::stri_replace_all_regex(article, "\\s+", " "))]
+    dt[, word_count := stringi::stri_count_words(article)]
+    dt[, ocr_nonalpha := { tot <- nchar(article)
+                           fifelse(tot > 0, 1 - stringi::stri_count_regex(article, "[A-Za-z]") / tot, NA_real_) }]
+    dt[, year := yr]
+    before <- nrow(dt)
+    dt <- dt[word_count >= MIN_WORDS & (is.na(ocr_nonalpha) | ocr_nonalpha <= MAX_NONALPHA)]
+    dt <- unique(dt, by = "article")   # exact-duplicate text drop (syndicated boilerplate)
+    dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+    tmp <- paste0(outpath, ".tmp"); arrow::write_parquet(dt, tmp); file.rename(tmp, outpath)
+    sprintf("%d: %d -> %d kept (%.1f%%)", yr, before, nrow(dt), 100 * nrow(dt) / before)
+  }, error = function(e) {
+    tmpf <- paste0(outpath, ".tmp"); if (file.exists(tmpf)) unlink(tmpf)  # drop partial; year retries next run
+    sprintf("%d: ERROR (%s)", yr, conditionMessage(e))
+  })
 }
+
+# Resource-headroom policy: use <=80% of RAM/CPU, leave headroom for the OS and the parallel
+# didgpu DiD work on this box. Never push for max speed -- a restart or RAM fight costs more than
+# it saves. MEASURED (2026-05-26): a window year is ~3.8 GB raw and peaks ~25-35 GB in memory while
+# cleaning (text normalization transiently doubles the article vector); 3 concurrent workers
+# exhausted all 127 GB. So fix a SMALL, deterministic pool -- NO live WMI probe (Get-CimInstance
+# hangs while WMI is busy and would stall the whole stage). 2 workers x ~30 GB ~= 60 GB (<50% RAM)
+# leaves ample room to coexist with the DiD work. Override with CAPLAN_CLEAN_WORKERS if running solo.
+NCLEAN_WORKERS <- as.integer(Sys.getenv("CAPLAN_CLEAN_WORKERS", "2"))
+nworkers <- max(1L, min(NCLEAN_WORKERS, length(raw_files)))
+message(sprintf("%d parallel clean workers (~30 GB/year peak; fixed for stability + coexistence)", nworkers))
+cl <- parallel::makeCluster(nworkers)
+parallel::clusterEvalQ(cl, {
+  library(arrow); library(data.table); library(stringi)
+  data.table::setDTthreads(2L)                          # avoid nworkers x 24-thread DT oversubscription
+  arrow::set_cpu_count(2L); arrow::set_io_thread_count(2L)
+})
+parallel::clusterExport(cl, c("cleaned_dir", "TEXT_COL", "MIN_WORDS", "MAX_NONALPHA"), envir = environment())
+print(unlist(parallel::parLapplyLB(cl, raw_files, clean_one)))   # LB: dispatch in order -> window-first
+parallel::stopCluster(cl)
 ```
 
 ## Summary

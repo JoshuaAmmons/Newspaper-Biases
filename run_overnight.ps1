@@ -12,7 +12,8 @@
 
 $env:CAPLAN_ROOT       = "C:\Users\jdamm\Dropbox\Caplan Project"
 $env:CAPLAN_DATA       = "C:\Users\jdamm\Caplan"
-$env:CAPLAN_SCORE_YEARS = "1895-1945"      # RF corpus scoring scoped to the analysis window
+$env:CAPLAN_CLEAN_YEARS = "1895-1945,1770-1894,1946-1964"  # clean the FULL corpus, but window-FIRST (overnight #1 ran clean serial+ascending and burned the night on 1770-1869, never reaching the window). 02 now dispatches in this order, load-balanced.
+$env:CAPLAN_SCORE_YEARS = "1895-1945"      # RF corpus scoring scoped to the analysis window (the expensive stage; full-corpus scoring is the long-running hand-off)
 $ROOT = $env:CAPLAN_ROOT
 $VPY  = "C:\Users\jdamm\Caplan\venv\Scripts\python.exe"
 $RS   = "C:\Program Files\R\R-4.6.0\bin\Rscript.exe"

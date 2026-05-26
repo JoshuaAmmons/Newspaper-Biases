@@ -74,7 +74,7 @@ if (file.exists(log)) {
 |---|---|---|---|---|
 | Corpus download | wait (network) | ~5 h | TBD | ~75–110 GB/hr observed |
 | Ingest tar.gz → parquet | CPU (parallel) | ~1–2 h | TBD | |
-| Clean (02) | CPU | ~2–4 h | TBD | ~25 min / 25.7M (slice) |
+| Clean (02) | CPU | ~2–4 h | **SERIAL ~14 h → only 1770–1869 (~100 yrs), never reached window — bottleneck. Parallelized 2026-05-26 (§4).** | ~25 min / 25.7M (slice) |
 | Geolink LCCN→county (03) | network (cached) | ~1–2 h | TBD | bounded by # titles |
 | Lexicon scoring (06a) | CPU (parallel) | ~1–3 h | TBD | 25.7M in minutes (slice) |
 | RF features + train (06b/c) | CPU | ~0.5–1 h | TBD | minutes on slice |
@@ -122,13 +122,22 @@ if (file.exists(log)) {
 
 ### Operational policy (from prior-run experience)
 
+- **Resource-headroom policy — ≤80% utilization, ≥20% free (2026-05-26).** When launching parallel
+  agents (clean workers, RF scoring, GPU RoBERTa workers), size them to use **at most ~80% of RAM,
+  CPU, and GPU**, leaving **≥20% free** for the OS and any concurrent work on the box (notably the
+  parallel `didgpu` DiD run). **Do not push for max speed** — a process restart or RAM fight costs
+  far more than the speedup. Prompted by overnight #2, where a 10-worker clean OOM'd while another
+  process held ~465 GB committed; `02` now sizes workers by 80% of *total* RAM (not momentarily-free)
+  so the buffer survives mid-run contention. **Applies to every stage's launch math below.**
 - **Checkpoint scoring frequently.** Scorers write **per batch** (atomic part files; resume by
   skipping completed batches), so a crash/reboot loses ≤ one batch (minutes), not a whole year.
   Implemented in `06c`; the RoBERTa scorer will match. Target: save ≤ every 30 min.
-- **Parallel GPU scoring workers.** Run ~**4 concurrent workers** on the 24 GB Blackwell (vs 2
-  on the 12 GB 4000 Ada), **sharded by year** (independent writes, no collisions), each
-  checkpointing. Speedup is sublinear (shared GPU compute) → benchmark N = 1/2/4. The **RF**
-  scorer stays a **single process on all 24 cores** (CPU-bound; extra processes would oversubscribe).
+- **Parallel GPU scoring workers.** Shard by year (independent writes, no collisions), each
+  checkpointing. Cap worker count by the **80% VRAM ceiling** (≤~19 GB of the 24 GB Blackwell):
+  if each model instance needs ~5–6 GB, that is **~3 workers, not a blind 4** — benchmark N = 1/2/3.
+  (Earlier note said ~4 on the Blackwell vs 2 on the 12 GB 4000 Ada; revised down to respect the
+  headroom policy.) The **RF** scorer stays a **single process** but pinned to **~80% of cores**
+  (`num.threads ≈ 19`, not all 24), since the box may be shared with the DiD work.
 - **DiD is fast** (minutes–~1 h) — not a bottleneck; scoring dominates.
 - **Years:** the manifest lists 180 per-year *files* (1770–1964, with calendar gaps); the count
   with *usable* data after cleaning is lower (~172, per prior project), and the DiD only needs the
@@ -175,3 +184,17 @@ scope + staged relevance gate may beat it, but the cost is the weeks-to-months c
   scoring checkpoints (≤30-min loss target; implemented in 06c), ~4 parallel GPU scoring workers
   on the Blackwell (sharded by year; benchmark N), DiD is fast (revised that row down ~4–8 h →
   ~1–3 h), and the usable-year count is ~172 (not 180 files); analysis only needs 1895–1945.
+- **2026-05-26 (overnight-run #1 actuals + clean bottleneck found)** — First unattended run
+  (`run_overnight.ps1`, ~14.5 h wall-clock) **never reached the analysis window.** The CLEAN
+  stage (02) was **serial and unscoped**, so it processed years from 1770 forward and reached
+  only ~1770–1869 (~100 partitions) before the night ended — lexicon/features/RF for 1895–1945
+  never ran. Root cause: serial clean is far slower than the ~2–4 h estimate on the heavy
+  mid-corpus years (e.g., 1856 = 1.43M articles → 1.29M kept, ~90%; tens of min each). **Fixes:**
+  (a) parallelized clean across years with a PSOCK cluster (cap ~10 workers; RAM-bound), atomic
+  per-year writes, skip-if-done — in `rmd/02_clean_articles.Rmd`; (b) scope clean to the window
+  via `CAPLAN_CLEAN_YEARS=1895–1945` in `run_overnight.ps1` so it stops wasting time on
+  out-of-window years. The ~1770–1869 partitions already cleaned are moved to
+  `articles_cleaned_prewindow/` (preserved, not deleted) so the window dataset is exactly
+  1895–1945 for downstream 06a/06b/06c with no code changes. Reboots during the run were mostly
+  user-initiated; the script is resumable, so each relaunch skips completed work. **Lesson:**
+  scope *every* stage to 1895–1945, not just scoring; the clean estimate row is updated in §2.
