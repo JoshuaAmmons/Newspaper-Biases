@@ -1,7 +1,7 @@
 # run_overnight.ps1 — unattended sequential RF-baseline pipeline.
 #
 # Stages (each resumable / skip-if-done): ingest -> clean -> lexicon -> features ->
-# RF train + score (1895-1945 window). Validated stages ONLY — no API-cost LLM jury
+# RF train + score (FULL corpus, window-first). Validated stages ONLY — no API-cost LLM jury
 # calls and no (unreviewed) RoBERTa scoring; those are run attended.
 #
 # Fail-fast: if any stage exits non-zero, the run stops cleanly so we can resume.
@@ -13,7 +13,7 @@
 $env:CAPLAN_ROOT       = "C:\Users\jdamm\Dropbox\Caplan Project"
 $env:CAPLAN_DATA       = "C:\Users\jdamm\Caplan"
 $env:CAPLAN_CLEAN_YEARS = "1895-1945,1770-1894,1946-1964"  # clean the FULL corpus, but window-FIRST (overnight #1 ran clean serial+ascending and burned the night on 1770-1869, never reaching the window). 02 now dispatches in this order, load-balanced.
-$env:CAPLAN_SCORE_YEARS = "1895-1945"      # RF corpus scoring scoped to the analysis window (the expensive stage; full-corpus scoring is the long-running hand-off)
+$env:CAPLAN_SCORE_YEARS = "1895-1945,1770-1894,1946-1964"  # FULL corpus, window-FIRST: measure bias for EVERY year (the DiD only USES shock years 1895-1945, but scores are produced corpus-wide per the "whole thing" directive). Long-running but $0 API and resumable.
 $ROOT = $env:CAPLAN_ROOT
 $VPY  = "C:\Users\jdamm\Caplan\venv\Scripts\python.exe"
 $RS   = "C:\Program Files\R\R-4.6.0\bin\Rscript.exe"
@@ -41,6 +41,6 @@ Log "DONE  ingest"
 Log "STAGE 2/5: clean";                              RunR "02_clean_articles.Rmd"
 Log "STAGE 3/5: lexicon scoring";                    RunR "06a_baseline_lexicon.Rmd"
 Log "STAGE 4/5: TF-IDF/SVD features + transform";    RunR "06b_baseline_features.Rmd"
-Log "STAGE 5/5: RF train + score window (1895-1945)"; RunR "06c_baseline_rf.Rmd"
+Log "STAGE 5/5: RF train + score FULL corpus (window-first)"; RunR "06c_baseline_rf.Rmd"
 
 Log "=== OVERNIGHT RUN COMPLETE (RF-baseline pipeline) ==="

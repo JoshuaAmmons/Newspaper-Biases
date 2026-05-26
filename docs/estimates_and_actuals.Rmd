@@ -112,6 +112,58 @@ if (file.exists(log)) {
   12 GB; fp16/bf16 + ONNX/TensorRT + tuned batch size. Best case ~1–4 weeks scoring — pending a
   measured one-year benchmark (§2 caveats).
 
+### Revision §2b — full-corpus scope re-estimate + session lessons (2026-05-26)
+
+> SCOPE CHANGE (§4): measurement — clean + lexicon + RF/RoBERTa **scoring** — now spans the
+> **whole corpus**, not the 1895–1945 window. The window survives only as the DiD treatment span
+> (08/09); more pre-treatment years strengthen the DiD, so out-of-window scores are signal, not
+> waste. *Original §2/§2a numbers preserved above; this is an additive correction.*
+
+**Cost: UNCHANGED (~$40–80 total).** API cost is set by the bounded ~10k labeling sample, not
+corpus size — local RF/RoBERTa scoring is $0. Widening the sample to span all eras keeps it ~10k
+(stratified over more decades), so the bill doesn't move. Scope ↑ ⇒ runtime ↑, **cost flat.**
+
+**Runtime — full-corpus vs. the windowed §2/§2a estimates:**
+
+| Stage | Windowed (prior) | Full-corpus (new) | Basis |
+|---|---|---|---|
+| Clean (02) | ~2–4 h (est) | **~3–4 h ACTUAL**, 2 workers | measured this session; was the stalled bottleneck, now fixed (parallel + OOM-resilient) |
+| Lexicon (06a) | ~1–3 h | ~2–4 h | CPU-parallel; ~linear in articles |
+| Features + RF train (06b/c) | ~0.5–1 h | ~1–2 h | more training data |
+| **RF corpus scoring (06c)** | days–weeks | **weeks** (~1.7–2.5×) | CPU; full÷window article ratio |
+| **RoBERTa scoring (06)** | weeks–months | **months — dominant long pole** (~1.7–2.5×) | GPU; anchored to incivility (§3) |
+| Panel + DiD (07/09) | ~1–3 h | ~1–3 h (unchanged) | small; consumes the scored panel |
+
+**Headline (full-corpus):** total-to-final-DiD is gated almost entirely by **full-corpus RoBERTa
+scoring → months-class** — the long-running hand-off the plan always anticipated. Window years
+score first, so analysis-ready outcome data lands in the first portion of the run. The ~1.7–2.5×
+multiplier is an estimate (1895–1945 is the high-volume core, so full-corpus is *not* a huge
+multiple by article count); **I'll pin it with exact per-year article counts once the clean
+finishes (within the hour).**
+
+**What I've learned (this session):**
+
+1. **The "cheap" stages can dominate.** Clean — penciled in at minutes–hours — became the
+   bottleneck when serial (~14 h, never reached the window). Each big year peaks **~25–35 GB in
+   RAM** (text normalization transiently doubles the article vector). Fix: small fixed worker pool
+   + per-year `tryCatch` (one OOM no longer aborts the run) + window-first dispatch → ~3–4 h actual.
+   *Profile memory and parallelize the unglamorous prep stages; don't eyeball them.*
+2. **Headroom beats max parallelism.** A 10-worker clean OOM'd; contention with a parallel job made
+   it worse. Now policy: **≤80 % RAM/CPU/GPU, ≥20 % free.** A killed worker or RAM fight costs more
+   than the speed it chased.
+3. **Scope discipline (the big one).** Measure everything; let only the small final DiD step apply
+   the window. This raises scoring load (~1.7–2.5×) but is methodologically right — and the cheapest
+   stage must not constrain the most expensive ones.
+4. **Cost is corpus-size-invariant** — reconfirmed. The scope change moves runtime, not the bill.
+5. **Check the data before building external pipelines.** Geolink (03) needed *no* LoC API — the
+   city/county/state is in the newspaper-title parenthetical (reused incivility's parser),
+   sidestepping a Cloudflare bot-block entirely.
+6. **"Reuse the validated repo" has limits.** Incivility used a newspaper-level *Coughlin-exposure*
+   design with **no county geolink**, so Caplan's county-shock design is genuinely new there.
+7. **Environment friction is budgetable.** The Store build of Dropbox crashes (root of the chronic
+   sync problem; switched to the classic client) and Windows WMI calls hang after big memory frees
+   (removed from unattended code). Small things, real hours.
+
 ### Caveats
 
 - The two corpus-scoring estimates are **extrapolated from small slices** — the biggest
@@ -198,3 +250,17 @@ scope + staged relevance gate may beat it, but the cost is the weeks-to-months c
   1895–1945 for downstream 06a/06b/06c with no code changes. Reboots during the run were mostly
   user-initiated; the script is resumable, so each relaunch skips completed work. **Lesson:**
   scope *every* stage to 1895–1945, not just scoring; the clean estimate row is updated in §2.
+- **2026-05-26 (scope REVERSAL: measure the WHOLE corpus; window is DiD-only)** — Supersedes the
+  prior bullet's "scope every stage to 1895–1945" lesson, per user directive: **score everything as
+  if the DiD step didn't exist.** Rationale: (a) more pre-treatment years *strengthen* the DiD
+  (longer parallel-trends / event-study leads), so out-of-window years are useful signal, not waste;
+  (b) the DiD (09) is a tiny step relative to cleaning + scoring the corpus, so it must not constrain
+  the expensive measurement stages. `YEARS_ANALYSIS` (1895–1945) is demoted to its real role — the
+  **shock window for stages 08/09 only** — and decoupled from measurement. Config: `CAPLAN_CLEAN_YEARS`
+  and now `CAPLAN_SCORE_YEARS` are both the **full corpus, window-first** (focal years land first;
+  ordering, not a limit). The earlier plan to move pre-window partitions to `articles_cleaned_prewindow/`
+  is **dropped** — all years stay in `articles_cleaned`. **To-do (attended LLM step):** widen
+  `04_sample_for_labeling` and the RoBERTa scorer (06) from `YEARS_ANALYSIS` to the full corpus so the
+  training set + classifier span every era. **Runtime:** full-corpus scoring is ~3× the windowed load
+  — the timeline long pole (weeks–months class, §3), accepted as the planned long-running hand-off;
+  $0 API, resumable, window-first so analysis-ready years come first.
