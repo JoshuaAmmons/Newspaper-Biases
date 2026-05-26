@@ -30,7 +30,8 @@ N_BASE    <- 100000L   # stratified random base (negatives + relevance signal)
 N_POS_PER <- 30000L    # cap of lexicon-positive oversample PER bias (rare biases keep all)
 N_SVD     <- 200L
 TOP_FEATS <- 10000L
-YEARS     <- as.integer(YEARS_ANALYSIS)   # 1895:1945
+# Training years: FULL corpus by default so the TF-IDF vocab + SVD represent every era that 06c
+# scores (override with CAPLAN_FEATURE_YEARS). Was YEARS_ANALYSIS (window) -- wrong once we score all.
 ```
 
 ## Stratified sample across analysis-window years (text + metadata + lexicon scores)
@@ -41,9 +42,16 @@ lex_dir     <- file.path(DATA_PARQUET, "articles_lexscored")
 
 yds <- list.files(cleaned_dir, pattern = "^year=\\d{4}$", full.names = TRUE)
 yrs <- as.integer(sub(".*year=(\\d{4}).*", "\\1", yds))
-keep <- yrs %in% YEARS & file.exists(file.path(lex_dir, paste0("lexscored_", yrs, ".parquet")))
+has_lex <- file.exists(file.path(lex_dir, paste0("lexscored_", yrs, ".parquet")))
+.fy <- Sys.getenv("CAPLAN_FEATURE_YEARS")          # default: ALL lexscored years (full corpus)
+if (nzchar(.fy)) {
+  sel  <- unlist(lapply(strsplit(.fy, ",")[[1]], function(p)
+    if (grepl("-", p)) do.call(seq, as.list(as.integer(strsplit(p, "-")[[1]]))) else as.integer(p)))
+  keep <- has_lex & (yrs %in% sel)
+} else keep <- has_lex
 yds <- yds[keep]; yrs <- yrs[keep]
 stopifnot(length(yds) > 0)
+message("feature-training years: ", length(yds), " (", min(yrs), "-", max(yrs), ")")
 
 # Oversample lexicon-positives so rare biases (anti_foreign/make_work) have enough RF
 # training positives, alongside a stratified random base (negatives + relevance signal).

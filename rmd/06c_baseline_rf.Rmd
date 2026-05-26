@@ -13,7 +13,7 @@ source(file.path(PROJECT_ROOT, "R", "helpers.R"))
 library(arrow); library(data.table); library(quanteda); library(Matrix); library(ranger); library(pROC)
 BIAS <- names(BIAS_SEED_LEXICONS)
 set.seed(SEED)
-NTHREAD <- max(1L, parallel::detectCores() - 2L)
+NTHREAD <- max(1L, as.integer(floor(0.8 * parallel::detectCores())))   # ~80% of cores per headroom policy
 quanteda_options(threads = NTHREAD)
 ```
 
@@ -82,14 +82,15 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 # Years to score: window years that have lexicon scores; optional CAPLAN_SCORE_YEARS override.
 avail <- as.integer(sub(".*lexscored_(\\d{4}).*", "\\1",
            list.files(lex_dir, pattern = "lexscored_\\d{4}\\.parquet$")))
-score_years <- sort(intersect(avail, as.integer(YEARS_ANALYSIS)))
-ov <- Sys.getenv("CAPLAN_SCORE_YEARS")
+score_years <- sort(avail)                              # default: every lexscored year (FULL corpus)
+ov <- Sys.getenv("CAPLAN_SCORE_YEARS")                  # optional narrow + ORDER (e.g. window-first, or one benchmark year)
 if (nzchar(ov)) {
   sel <- unlist(lapply(strsplit(ov, ",")[[1]], function(p)
     if (grepl("-", p)) do.call(seq, as.list(as.integer(strsplit(p, "-")[[1]]))) else as.integer(p)))
-  score_years <- sort(intersect(score_years, sel))
+  score_years <- intersect(sel, score_years)            # keep CAPLAN_SCORE_YEARS order (window-first)
 }
-message("scoring years: ", paste(score_years, collapse = ", "))
+message("scoring ", length(score_years), " years: ", paste(utils::head(score_years, 6), collapse = ", "),
+        if (length(score_years) > 6L) " ..." else "")
 B <- suppressWarnings(as.integer(Sys.getenv("CAPLAN_SCORE_BATCH"))); if (is.na(B)) B <- 100000L
 # Optional per-year row cap for fast smoke-testing (CAPLAN_SCORE_LIMIT); unset = score all.
 score_limit <- suppressWarnings(as.integer(Sys.getenv("CAPLAN_SCORE_LIMIT")))
@@ -105,6 +106,7 @@ featurize <- function(text) {
 for (yr in score_years) {
   out <- file.path(out_dir, paste0("scored_", yr, ".parquet"))
   if (file.exists(out)) { message(yr, ": exists"); next }
+  tryCatch({                                             # one bad year must not abort the long run (batches kept for resume)
   pf <- list.files(file.path(cleaned_dir, paste0("year=", yr)), pattern = "\\.parquet$", full.names = TRUE)[1]
   dt <- as.data.table(read_parquet(pf, col_select = c(
     "article_id","newspaper_name","lccn","date","page","year","word_count","ocr_nonalpha","headline","byline","article")))
@@ -142,5 +144,6 @@ for (yr in score_years) {
   tmp <- paste0(out, ".tmp"); write_parquet(rbindlist(lapply(parts, read_parquet), fill = TRUE), tmp)
   file.rename(tmp, out); unlink(part_dir, recursive = TRUE)
   message(sprintf("  %d: scored %d articles (%d batches)", yr, n, nb)); rm(dt, lx); gc()
+  }, error = function(e) message(sprintf("  %d: ERROR (%s) -- batches kept; rerun resumes", yr, conditionMessage(e))))
 }
 ```

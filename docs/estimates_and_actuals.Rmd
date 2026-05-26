@@ -221,6 +221,43 @@ That implies real sustained throughput on the order of **tens of articles/sec** 
 corpus-scoring runtime to this evidence, not to extrapolation.** Caplan's better GPU + windowed
 scope + staged relevance gate may beat it, but the cost is the weeks-to-months class.
 
+### External calibration #2 — the RoBERTa-scoring "shame log" (2026-05-26)
+
+The predecessor's own dated prediction-vs-reality log (`Dropbox/Geocode/claude_predictions.txt`) is
+the most decisive calibration we have for our dominant stage. Two same-corpus data points bracket it:
+
+- **Incivility RoBERTa (unoptimized): ~5 years left to score** (per user, 2026-05-26) — the cautionary
+  baseline: naive single worker + `padding="max_length"` + whole-year loads.
+- **Antisemitism RoBERTa (same corpus, *optimized*): full corpus in ~2 months**, sustaining
+  **~3,200 articles/min** (batch=128, fp16, **dynamic padding**) on an **RTX 4000 Ada 12 GB**.
+
+**That ~25× gap is *entirely* the optimizations below — they are mandatory, not nice-to-haves.**
+
+| HELPS (measured) | HURTS (cost them days–years) |
+|---|---|
+| **Dynamic padding** (`padding=True`) — **~5×** | `padding="max_length"` (pads every seq to 512) |
+| **batch_size 48 → 128** — **~3×** (24 GB allows higher) | tiny batches |
+| **Chunked row-group reads** (~1M rows at a time) | whole 5 GB year → ~15–20 GB RAM → **CUDA OOM** |
+| **Per-chunk checkpointing** (resume skips done) | no checkpoints → one crash lost **4.2M scored articles** |
+| **GPU does ~88–97%**; CPU workers are a rounding error | leaning on CPU workers for throughput |
+| **Keep machine awake + monitor liveness** | sleep/reboot killed workers **unnoticed for days** |
+| **Test the API before a long run** | Gemini 2.5-Pro "thinking mode" wrote **empty labels** for an hour |
+| Worker fns at **module level** | nested fns → Windows pickle crash (bit them **twice**) |
+| Verify GPU in **Task Manager** | `nvidia-smi "100%"` lied repeatedly |
+
+**Re-estimate — Caplan RoBERTa full-corpus scoring (anchored; supersedes the §2b hand-wave):**
+from their optimized **~3,200/min** on a 12 GB Ada, the **Blackwell 24 GB** (bigger batch + faster
+compute, ~2×) → **~6,000–9,000/min**. For our 307M articles:
+- **No relevance gate:** ≈ **~28 days** pure GPU.
+- **With a high-recall relevance gate** (stance heads on ~10%): ≈ **~1–2 weeks**.
+- **Shame-corrected** (their log underestimated *every single time*; assume crashes/reboots/contention):
+  **~3–6 weeks** realistic — **only if every HELPS lever is applied.** Skip them → **years**-class.
+
+**Meta-lesson (why this doc exists):** the predecessor was wrong on *every* timing call, always low,
+and fudge-factors never caught up. So — **benchmark one real year end-to-end before committing**
+(the planned 06c/RoBERTa benchmark), quote *ranges* not point estimates, and treat any reflexive
+"should be quick" as a red flag.
+
 ---
 
 ## 4. Change log
@@ -266,3 +303,16 @@ scope + staged relevance gate may beat it, but the cost is the weeks-to-months c
   training set + classifier span every era. **Runtime:** full-corpus scoring is ~3× the windowed load
   — the timeline long pole (weeks–months class, §3), accepted as the planned long-running hand-off;
   $0 API, resumable, window-first so analysis-ready years come first.
+- **2026-05-26 (RoBERTa calibration from the predecessor's "shame log")** — Added §3 "External
+  calibration #2" from the incivility/antisemitism prediction-vs-reality log. Anchors: incivility
+  RoBERTa has **~5 years left** (unoptimized) vs the antisemitism sibling's **~2 months** (same
+  corpus, optimized: ~3,200 art/min @ batch=128 + dynamic padding, RTX 4000 Ada 12 GB) — a ~25×
+  swing from optimizations alone. Recorded a HELPS/HURTS playbook and **re-anchored the Caplan
+  RoBERTa estimate to ~3–6 weeks** (Blackwell-scaled + relevance-gated + shame-corrected),
+  *conditional on applying every optimization*; unoptimized is the years-class. Mirrored to memory.
+- **2026-05-26 (Dropbox corruption + git recovery)** — The Dropbox reinstall made conflicted copies
+  and reverted `02_clean_articles.Rmd`, `run_overnight.ps1`, and this tracker to older versions
+  (lost the parallel clean, full-corpus scope, and scope-reversal entry). Recovered via
+  `git checkout HEAD --` on the three (git/.git was intact); 06a/06b/06c hardening was untouched.
+  **Standing rule: git, not Dropbox, is the source of truth for this repo — commit early/often, and
+  keep Dropbox from syncing the working tree during active edits.**

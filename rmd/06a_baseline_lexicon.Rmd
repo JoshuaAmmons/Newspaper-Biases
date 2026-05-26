@@ -33,24 +33,36 @@ score_year <- function(yd) {
   yr  <- as.integer(sub(".*year=(\\d{4}).*", "\\1", yd))
   out <- file.path(out_dir, paste0("lexscored_", yr, ".parquet"))
   if (file.exists(out)) return(paste0(yr, ": exists"))
-  pf <- list.files(yd, pattern = "\\.parquet$", full.names = TRUE)[1]
-  dt <- as.data.table(arrow::read_parquet(
-    pf, col_select = c("article_id","newspaper_name","lccn","date","page","year","article")))
-  for (b in names(BIAS_SEED_LEXICONS)) {
-    dt[[paste0(b, "_lex")]] <- lexicon_score(dt$article, BIAS_SEED_LEXICONS[[b]])
-  }
-  dt[, article := NULL]   # drop text; keep ids/meta + lexicon scores
-  tmp <- paste0(out, ".tmp")
-  arrow::write_parquet(dt, tmp); file.rename(tmp, out)
-  paste0(yr, ": ", nrow(dt), " scored")
+  tryCatch({                                            # one year's OOM must not abort the cluster
+    pf <- list.files(yd, pattern = "\\.parquet$", full.names = TRUE)[1]
+    dt <- as.data.table(arrow::read_parquet(
+      pf, col_select = c("article_id","newspaper_name","lccn","date","page","year","article")))
+    for (b in names(BIAS_SEED_LEXICONS)) {
+      dt[[paste0(b, "_lex")]] <- lexicon_score(dt$article, BIAS_SEED_LEXICONS[[b]])
+    }
+    dt[, article := NULL]   # drop text; keep ids/meta + lexicon scores
+    tmp <- paste0(out, ".tmp")
+    arrow::write_parquet(dt, tmp); file.rename(tmp, out)
+    paste0(yr, ": ", nrow(dt), " scored")
+  }, error = function(e) {
+    tmpf <- paste0(out, ".tmp"); if (file.exists(tmpf)) unlink(tmpf)   # drop partial; retries next run
+    paste0(yr, ": ERROR (", conditionMessage(e), ")")
+  })
 }
 
-# Cap workers to bound RAM (each loads one year's text transiently).
-ncores <- min(parallel::detectCores() - 2L, 12L)
-cl <- makeCluster(min(ncores, length(year_dirs)))
-clusterEvalQ(cl, { library(arrow); library(data.table); library(stringi) })
+# Worker count is RAM-bound (each loads one big year's text + tokenizes). Start conservative per
+# the clean-stage lesson (a 12-worker run would OOM on the giant years); tune with CAPLAN_LEX_WORKERS.
+# 3 x ~25 GB stays well under the 80% RAM headroom policy; raise it once a run proves stable.
+nworkers <- as.integer(Sys.getenv("CAPLAN_LEX_WORKERS", "3"))
+nworkers <- max(1L, min(nworkers, parallel::detectCores() - 2L, length(year_dirs)))
+message(sprintf("lexicon scoring: %d workers over %d years", nworkers, length(year_dirs)))
+cl <- makeCluster(nworkers)
+clusterEvalQ(cl, {
+  library(arrow); library(data.table); library(stringi)
+  data.table::setDTthreads(2L); arrow::set_cpu_count(2L); arrow::set_io_thread_count(2L)
+})
 clusterExport(cl, c("BIAS_SEED_LEXICONS", "lexicon_score", "out_dir"), envir = environment())
-res <- parLapply(cl, year_dirs, score_year)
+res <- parLapplyLB(cl, year_dirs, score_year)   # LB: dispatch one year at a time, even out big years
 stopCluster(cl)
 print(unlist(res))
 ```
