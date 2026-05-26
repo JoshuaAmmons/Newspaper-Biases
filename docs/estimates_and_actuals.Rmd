@@ -130,16 +130,18 @@ corpus size — local RF/RoBERTa scoring is $0. Widening the sample to span all 
 | Clean (02) | ~2–4 h (est) | **~3–4 h ACTUAL**, 2 workers | measured this session; was the stalled bottleneck, now fixed (parallel + OOM-resilient) |
 | Lexicon (06a) | ~1–3 h | ~2–4 h | CPU-parallel; ~linear in articles |
 | Features + RF train (06b/c) | ~0.5–1 h | ~1–2 h | more training data |
-| **RF corpus scoring (06c)** | days–weeks | **weeks** (~1.7–2.5×) | CPU; full÷window article ratio |
-| **RoBERTa scoring (06)** | weeks–months | **months — dominant long pole** (~1.7–2.5×) | GPU; anchored to incivility (§3) |
+| **RF corpus scoring (06c)** | days–weeks | **weeks** (1.53× measured) | CPU; full÷window article ratio |
+| **RoBERTa scoring (06)** | weeks–months | **months — dominant long pole** (1.53× measured) | GPU; anchored to incivility (§3) |
 | Panel + DiD (07/09) | ~1–3 h | ~1–3 h (unchanged) | small; consumes the scored panel |
 
 **Headline (full-corpus):** total-to-final-DiD is gated almost entirely by **full-corpus RoBERTa
 scoring → months-class** — the long-running hand-off the plan always anticipated. Window years
-score first, so analysis-ready outcome data lands in the first portion of the run. The ~1.7–2.5×
-multiplier is an estimate (1895–1945 is the high-volume core, so full-corpus is *not* a huge
-multiple by article count); **I'll pin it with exact per-year article counts once the clean
-finishes (within the hour).**
+score first, so analysis-ready outcome data lands in the first portion of the run. The full÷window
+multiplier is now **PINNED (2026-05-26, clean complete 180/180): 307.2M articles total; 200.4M in the
+1895–1945 window = 65.2 % of the corpus ⇒ full÷window = 1.53×.** The window already holds the
+peak-volume 1890s–1910s decades (1900s+1910s ≈ 130M articles), so the full-corpus scope premium is
+only ~50 % — *less* than the 1.7–2.5× first guessed. Decade volumes (M articles): 1850s 11 · 1860s
+14 · 1870s 18 · 1880s 26 · 1890s 46 · 1900s 61 · 1910s 69 · 1920s 28 · 1930s 10 · 1940s 9 · 1950s 6.
 
 **What I've learned (this session):**
 
@@ -152,7 +154,7 @@ finishes (within the hour).**
    it worse. Now policy: **≤80 % RAM/CPU/GPU, ≥20 % free.** A killed worker or RAM fight costs more
    than the speed it chased.
 3. **Scope discipline (the big one).** Measure everything; let only the small final DiD step apply
-   the window. This raises scoring load (~1.7–2.5×) but is methodologically right — and the cheapest
+   the window. This raises scoring load (1.53× measured) but is methodologically right — and the cheapest
    stage must not constrain the most expensive ones.
 4. **Cost is corpus-size-invariant** — reconfirmed. The scope change moves runtime, not the bill.
 5. **Check the data before building external pipelines.** Geolink (03) needed *no* LoC API — the
