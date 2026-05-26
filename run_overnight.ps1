@@ -10,7 +10,7 @@
 # Usage:  powershell -File run_overnight.ps1     (or launch in background)
 # Progress log: C:\Users\jdamm\Caplan\overnight.log
 
-$env:CAPLAN_ROOT       = "C:\Users\jdamm\Dropbox\Caplan Project"
+$env:CAPLAN_ROOT       = "C:\Users\jdamm\Caplan\Caplan-Project"   # PRIMARY repo, moved out of Dropbox 2026-05-26 (Dropbox corrupted the working tree); data lives alongside at CAPLAN_DATA
 $env:CAPLAN_DATA       = "C:\Users\jdamm\Caplan"
 $env:CAPLAN_CLEAN_YEARS = "1895-1945,1770-1894,1946-1964"  # clean the FULL corpus, but window-FIRST (overnight #1 ran clean serial+ascending and burned the night on 1770-1869, never reaching the window). 02 now dispatches in this order, load-balanced.
 $env:CAPLAN_SCORE_YEARS = "1895-1945,1770-1894,1946-1964"  # FULL corpus, window-FIRST: measure bias for EVERY year (the DiD only USES shock years 1895-1945, but scores are produced corpus-wide per the "whole thing" directive). Long-running but $0 API and resumable.
