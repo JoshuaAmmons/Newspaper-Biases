@@ -1,5 +1,5 @@
 ---
-title: "05 — Weak-label, audit, and build train/dev/test"
+title: "05 — Jury-label and build train/dev/test"
 output: html_document
 ---
 
@@ -14,95 +14,69 @@ library(arrow); library(data.table); library(dplyr)
 set.seed(SEED)
 ```
 
-Turns the labeling queue into supervised splits: (1) LLM weak-labels via `python/llm_label.py`,
-(2) a **human audit** of a stratified subset establishes reliability, (3) build `train/dev/test`
-split **by title + year** to prevent leakage. See docs/CODEBOOK.md.
+Turns the labeling queue into supervised splits: (1) the **multi-LLM jury** (`python/label_jury.py`)
+labels every passage — competitors vote, Claude adjudicates *only* contested rows; (2) map stances to
+binary targets; (3) split **train/dev/test by title + year** to prevent leakage. **Fully automated —
+no human-in-the-loop**; validity is anchored by the codebook **gold/adversarial suite** (CODEBOOK §5).
+The jury makes **paid API calls** — run `python/label_jury.py preflight` first to confirm keys/models.
 
-## 1. Run LLM weak-labeling
+## 1. Run the multi-LLM jury (competitors → merge → Claude adjudicates contested)
 
-```{r llm-label}
+```{r jury}
 queue   <- file.path(DATA_PANELS, "label_queue.parquet")
-labels  <- file.path(DATA_PANELS, "llm_labels.parquet")
-# Requires GEMINI_API_KEY (or ANTHROPIC_API_KEY) in the environment.
-if (!file.exists(labels)) {
+outdir  <- file.path(DATA_PANELS, "label_out")
+final_p <- file.path(outdir, "final.parquet")
+stopifnot(file.exists(queue))
+# label_jury.py reads keys from CAPLAN_KEYS_FILE (default LLM/Keys.env.txt) -- never committed.
+# Resumable: re-running skips providers/rows already done. Delete final.parquet to force a full redo.
+if (!file.exists(final_p)) {
   exit <- system2(PYTHON_EXE, args = c(
-    shQuote(file.path(PROJECT_ROOT, "python", "llm_label.py")),
-    "--in",  shQuote(queue), "--out", shQuote(labels),
-    "--provider", "gemini", "--model", "gemini-2.0-flash",
-    "--text-col", "text", "--id-col", "article_id"
-  ), stdout = "", stderr = "", wait = TRUE)
-  if (exit != 0) warning("llm_label.py exited ", exit)
+    shQuote(file.path(PROJECT_ROOT, "python", "label_jury.py")), "run",
+    "--queue", shQuote(queue), "--outdir", shQuote(outdir),
+    "--id-col", "article_id", "--text-col", "text"),
+    stdout = "", stderr = "", wait = TRUE)
+  if (exit != 0) stop("label_jury.py run exited with ", exit)
 }
-lab <- as.data.table(read_parquet(labels))
-message("LLM labels: ", nrow(lab), "; parse_ok: ", sum(lab$parse_ok, na.rm = TRUE))
+lab <- as.data.table(read_parquet(final_p))
+message(sprintf("jury labels: %d  |  contested: %d (%.1f%%)  |  high-confidence: %d",
+                nrow(lab), sum(lab$contested, na.rm = TRUE),
+                100 * mean(lab$contested, na.rm = TRUE), sum(lab$confidence == "high", na.rm = TRUE)))
 ```
 
-## 2. Define binary targets
+## 2. Binary targets (only stance = "endorse" marks a bias present)
 
 ```{r targets}
 q <- as.data.table(read_parquet(queue))
 d <- merge(q, lab, by = "article_id", all.x = TRUE)
-
 d[, relevance := fifelse(is.na(relevance), 0L, as.integer(relevance))]
 for (b in c("anti_market", "anti_foreign", "make_work", "pessimistic")) {
-  st <- paste0(b, "_stance")
-  d[, (paste0("y_", b)) := fifelse(get(st) %in% "endorse", 1L, 0L)]
+  d[, (paste0("y_", b)) := fifelse(get(paste0(b, "_stance")) %in% "endorse", 1L, 0L)]
 }
-# Drop unusable OCR for training
-d <- d[is.na(quality) | quality != "unusable"]
-message("Label base rates:")
-print(d[, lapply(.SD, mean), .SDcols = patterns("^y_|relevance")])
+message("label base rates (mean):")
+print(d[, lapply(.SD, function(x) round(mean(x, na.rm = TRUE), 4)),
+        .SDcols = patterns("^y_|^relevance$")])
+print(d[, .N, by = confidence])
 ```
 
-## 3. Human audit subset (reliability)
-
-```{r audit}
-audit_path <- file.path(DATA_PANELS, "audit_human.csv")
-if (!file.exists(audit_path)) {
-  # Stratify the audit by bias-candidate and era so rare positives are checked.
-  d[, era := (year %/% 10) * 10]
-  audit <- d[, .SD[sample(.N, min(.N, 30))], by = .(sample_reason, era)]
-  cols <- c("article_id", "text", "relevance",
-            paste0("y_", c("anti_market","anti_foreign","make_work","pessimistic")))
-  out <- audit[, ..cols]
-  out[, `:=`(h_relevance = NA_integer_,
-             h_anti_market = NA_integer_, h_anti_foreign = NA_integer_,
-             h_make_work = NA_integer_, h_pessimistic = NA_integer_)]
-  fwrite(out, audit_path)
-  message("Wrote ", nrow(out), " rows to audit_human.csv.")
-  message("TODO(human): fill the h_* columns per CODEBOOK, then re-run this chunk.")
-} else {
-  a <- fread(audit_path)
-  if (!all(is.na(a$h_relevance))) {
-    # Cohen's kappa on stance agreement (LLM vs human) per bias
-    kappa <- function(x, y) {
-      ok <- !is.na(x) & !is.na(y); x <- x[ok]; y <- y[ok]
-      po <- mean(x == y); pe <- sum(table(x)/length(x) * table(y)/length(y))
-      (po - pe) / (1 - pe)
-    }
-    for (b in c("anti_market","anti_foreign","make_work","pessimistic")) {
-      message(sprintf("  kappa[%s] = %.2f", b,
-                      kappa(a[[paste0("y_", b)]], a[[paste0("h_", b)]])))
-    }
-    message("Target kappa >= 0.6 before trusting LLM labels at scale (CODEBOOK §5).")
-  }
-}
-```
-
-## 4. Train/dev/test split (by title + year, no leakage)
+## 3. Train/dev/test split (by title × 5-year block, no leakage)
 
 ```{r split}
-grp_col <- if ("lccn" %in% names(d)) "lccn" else "newspaper_name"
-d[, grp := paste0(get(grp_col), "_", (year %/% 5) * 5)]   # title x 5-year block
-groups <- unique(d$grp); g <- sample(groups)
-n <- length(g)
-train_g <- g[1:floor(.7*n)]; dev_g <- g[(floor(.7*n)+1):floor(.85*n)]; test_g <- g[(floor(.85*n)+1):n]
-
-splits <- list(train = d[grp %in% train_g], dev = d[grp %in% dev_g], test = d[grp %in% test_g])
+grp_col <- if ("lccn" %in% names(d) && d[, sum(!is.na(lccn))] > 0L) "lccn" else "newspaper_name"
+d[, grp := paste0(get(grp_col), "_", (year %/% 5L) * 5L)]   # title × 5-year block
+g <- sample(unique(d$grp)); n <- length(g)
+train_g <- g[seq_len(floor(.70 * n))]
+dev_g   <- g[(floor(.70 * n) + 1L):floor(.85 * n)]
+test_g  <- g[(floor(.85 * n) + 1L):n]
+splits  <- list(train = d[grp %in% train_g], dev = d[grp %in% dev_g], test = d[grp %in% test_g])
+keep <- c("article_id", "text", "relevance", "confidence",
+          paste0("y_", c("anti_market", "anti_foreign", "make_work", "pessimistic")))
 for (nm in names(splits)) {
-  keep <- c("article_id", "text", "relevance",
-            paste0("y_", c("anti_market","anti_foreign","make_work","pessimistic")))
-  write_parquet(splits[[nm]][, ..keep], file.path(DATA_PANELS, paste0(nm, ".parquet")))
-  message(nm, ": ", nrow(splits[[nm]]))
+  write_parquet(splits[[nm]][, intersect(keep, names(splits[[nm]])), with = FALSE],
+                file.path(DATA_PANELS, paste0(nm, ".parquet")))
+  message(nm, ": ", nrow(splits[[nm]]), " passages")
 }
 ```
+
+Validity is anchored by the codebook **gold/adversarial suite** (relevance + endorse precision/recall;
+CODEBOOK §5) — no human audit, by design. Next: RoBERTa trains on `train`/`dev`, evaluated on `test`
++ the gold suite (`rmd/06`).

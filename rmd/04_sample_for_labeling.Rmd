@@ -14,84 +14,109 @@ library(arrow); library(data.table); library(dplyr)
 set.seed(SEED)
 ```
 
-Builds `data_panels/label_queue.parquet`: the passages to label (LLM + human audit, step 05).
-Two ingredients (docs/PROJECT_PLAN.md §6.1): a **stratified random base** (across decade ×
-region, so the model sees ordinary text and the relevance gate is calibrated) plus
-**oversampled positives** for each bias using the seed lexicons in `R/helpers.R`
-(`BIAS_SEED_LEXICONS`) — lexicons are for *finding candidates only*, never the final measure.
+Builds `data_panels/label_queue.parquet`: the ~10k passages for the jury (step 05). Two
+ingredients (docs/PROJECT_PLAN.md §6.1): a **stratified random base** (decade × region — calibrates
+the relevance gate and supplies negatives) plus **oversampled candidate-positives** per bias.
+
+MEMORY-SAFE + FULL-ERA: we sample ids from the **06a lexscored** parquets (ids + lexicon scores,
+*no text*), then fetch article text for **only the ~10k selected rows** — so this never loads the
+corpus text into memory, and it spans every era RoBERTa will score (override `CAPLAN_SAMPLE_YEARS`).
+The lexicon is a *candidate finder only*, never the final measure. (Requires 06a lexscored output.)
 
 ## Parameters
 
 ```{r params}
-N_BASE     <- 4000   # stratified random passages (relevance-gate + negatives)
-N_POS_PER  <- 1500   # oversampled candidate-positive passages PER bias
-# => ~4000 + 4*1500 = ~10k passages to weak-label; audit a stratified subset by hand.
+N_BASE    <- 4000L    # stratified random passages (relevance gate + negatives)
+N_POS_PER <- 1500L    # candidate-positive oversample PER bias (rare biases keep all they have)
+BIAS      <- names(BIAS_SEED_LEXICONS)
+lexcols   <- paste0(BIAS, "_lex")
 ```
 
-## Load cleaned corpus + region
+## Gather ids from the lexscored parquets (no text loaded)
 
-```{r load}
-ds <- open_dataset(file.path(DATA_PARQUET, "articles_cleaned"))
-xwalk <- read_parquet(file.path(DATA_PANELS, "xwalk_lccn_county.parquet")) |>
-  as.data.table()
-key_col <- if ("lccn" %in% names(xwalk)) "lccn" else "article_id"
-
-# Restrict to the analysis window to keep the sample on-target.
-yrs <- as.integer(YEARS_ANALYSIS)
-base_tbl <- ds |>
-  filter(year %in% yrs) |>
-  select(article_id, article, year, any_of(c("lccn", "newspaper_name"))) |>
-  collect() |> as.data.table()
-
-base_tbl <- merge(base_tbl, xwalk[, .(key = get(key_col), region)],
-                  by.x = if ("lccn" %in% names(base_tbl)) "lccn" else "article_id",
-                  by.y = "key", all.x = TRUE)
-base_tbl[is.na(region), region := "Unknown"]
-base_tbl[, decade := (year %/% 10) * 10]
-message("Articles in window: ", nrow(base_tbl))
-```
-
-## Stratified random base
-
-```{r base-sample}
-strata <- base_tbl[, .(n = .N), by = .(decade, region)]
-strata[, take := pmax(1, round(N_BASE * n / sum(n)))]
-base_sample <- base_tbl[, .SD[sample(.N, min(.N, strata[.(decade[1], region[1]),
-                              on = .(decade, region), take]))],
-                        by = .(decade, region)]
-base_sample[, sample_reason := "base_stratified"]
-message("Base sample: ", nrow(base_sample))
-```
-
-## Oversample candidate positives per bias
-
-```{r oversample}
-pos_list <- list()
-for (b in names(BIAS_SEED_LEXICONS)) {
-  base_tbl[, sc := lexicon_score(article, BIAS_SEED_LEXICONS[[b]])]
-  cand <- base_tbl[sc > 0][order(-sc)]
-  take <- head(cand, N_POS_PER)
-  take[, sample_reason := paste0("seed_", b)]
-  pos_list[[b]] <- take
-  message(sprintf("  %-12s candidates>0: %d, taken: %d", b, nrow(cand), nrow(take)))
+```{r gather-ids}
+lex_dir <- file.path(DATA_PARQUET, "articles_lexscored")
+stopifnot(dir.exists(lex_dir))
+lex_files <- list.files(lex_dir, pattern = "lexscored_\\d{4}\\.parquet$", full.names = TRUE)
+.sy <- Sys.getenv("CAPLAN_SAMPLE_YEARS")                       # default: ALL eras
+if (nzchar(.sy)) {
+  sel <- unlist(lapply(strsplit(.sy, ",")[[1]], function(p)
+    if (grepl("-", p)) do.call(seq, as.list(as.integer(strsplit(p, "-")[[1]]))) else as.integer(p)))
+  fy  <- as.integer(sub(".*lexscored_(\\d{4}).*", "\\1", lex_files))
+  lex_files <- lex_files[fy %in% sel]
 }
-base_tbl[, sc := NULL]
-pos_sample <- rbindlist(pos_list, fill = TRUE)
+stopifnot(length(lex_files) > 0)
+message("sampling ids from ", length(lex_files), " lexscored years (no text loaded)")
+
+# Per-year: a small base pool (ids only) + all per-bias candidates (lex>0). Never reads text.
+base_per_year <- ceiling((N_BASE * 4) / length(lex_files))     # generous pool, post-stratified below
+base_pool <- vector("list", length(lex_files))
+cand_pool <- setNames(vector("list", length(BIAS)), BIAS)
+for (i in seq_along(lex_files)) {
+  d <- as.data.table(read_parquet(lex_files[i], col_select = c("article_id", "year", "lccn", lexcols)))
+  base_pool[[i]] <- d[sample(.N, min(.N, base_per_year)), .(article_id, year, lccn)]
+  for (b in BIAS) {
+    cb <- d[get(paste0(b, "_lex")) > 0, .(article_id, year, lccn, sc = get(paste0(b, "_lex")))]
+    if (nrow(cb)) cand_pool[[b]][[length(cand_pool[[b]]) + 1L]] <- cb
+  }
+  rm(d)
+}
 ```
 
-## Combine, dedupe, write queue
+## Select ids: stratified base + per-bias candidate positives
 
-```{r write}
-queue <- rbindlist(list(base_sample, pos_sample), fill = TRUE)
-queue <- unique(queue, by = "article_id")           # an article enters once
-setnames(queue, "article", "text", skip_absent = TRUE)
-keep <- intersect(c("article_id", "text", "year", "region", "decade",
-                    "lccn", "newspaper_name", "sample_reason"), names(queue))
+```{r select-ids}
+xwalk <- as.data.table(read_parquet(file.path(DATA_PANELS, "xwalk_lccn_county.parquet")))
+reg   <- unique(xwalk[, .(lccn, region)], by = "lccn")
+
+base_dt <- rbindlist(base_pool, fill = TRUE)
+base_dt <- merge(base_dt, reg, by = "lccn", all.x = TRUE)
+base_dt[is.na(region), region := "Unknown"]
+base_dt[, decade := (year %/% 10L) * 10L]
+strata  <- base_dt[, .(n = .N), by = .(decade, region)]
+strata[, take := pmax(1L, round(N_BASE * n / sum(n)))]
+base_sel <- base_dt[, .SD[sample(.N, min(.N, strata[.(decade[1], region[1]),
+                            on = .(decade, region), take]))], by = .(decade, region)]
+base_sel[, sample_reason := "base_stratified"]
+
+pos_parts <- list()
+for (b in BIAS) {
+  cb <- rbindlist(cand_pool[[b]], fill = TRUE)
+  ntook <- 0L
+  if (nrow(cb)) {
+    setorder(cb, -sc)
+    take <- head(cb, N_POS_PER); take[, sample_reason := paste0("seed_", b)]
+    pos_parts[[b]] <- take[, .(article_id, year, lccn, sample_reason)]
+    ntook <- nrow(take)
+  }
+  message(sprintf("  %-12s candidates>0: %d, taken: %d", b, nrow(cb), ntook))
+}
+sel <- unique(rbindlist(c(list(base_sel[, .(article_id, year, lccn, sample_reason)]), pos_parts),
+                        fill = TRUE), by = "article_id")
+message("distinct passages selected: ", nrow(sel))
+```
+
+## Fetch text for the selected ids only, then write the queue
+
+```{r fetch-text-write}
+ds  <- open_dataset(file.path(DATA_PARQUET, "articles_cleaned"))
+ids <- sel$article_id
+txt <- ds |> filter(article_id %in% ids) |>
+  select(article_id, article, newspaper_name) |> collect() |> as.data.table()
+
+queue <- merge(sel, txt, by = "article_id", all.x = TRUE)
+queue <- merge(queue, reg, by = "lccn", all.x = TRUE); queue[is.na(region), region := "Unknown"]
+queue[, decade := (year %/% 10L) * 10L]
+setnames(queue, "article", "text")
+queue <- queue[!is.na(text) & nchar(text) > 0]
+keep  <- intersect(c("article_id", "text", "year", "region", "decade",
+                     "lccn", "newspaper_name", "sample_reason"), names(queue))
 queue <- queue[, ..keep]
-
 write_parquet(queue, file.path(DATA_PANELS, "label_queue.parquet"))
 message("label_queue.parquet: ", nrow(queue), " passages")
 print(queue[, .N, by = sample_reason][order(-N)])
 ```
 
-Next: `python/llm_label.py` weak-labels this queue; `rmd/05` audits + builds train/dev/test.
+Next (the jury, attended/paid):
+`python/label_jury.py run --queue data_panels/label_queue.parquet --outdir data_panels/label_out`
+(competitors vote → merge → Claude adjudicates contested → `final.parquet`); then `rmd/05` builds train/dev/test.
