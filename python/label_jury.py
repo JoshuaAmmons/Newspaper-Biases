@@ -1,61 +1,47 @@
 """
-Multi-provider "jury" labeling for the four economic biases (anti_market,
-anti_foreign, make_work, pessimistic).
+Multi-provider "jury" labeling for Caplan's four economic biases (anti_market,
+anti_foreign, make_work, pessimistic), with a THREE-LEVEL escalation.
 
-Design (see docs/plans/01_llm_labeling.md):
-  * Independent COMPETITOR LLMs (different families) each label every passage with
-    the codebook prompt -> {relevance, per-bias stance}.
-  * VOTE-MERGE: where competitors agree, accept (confidence=high); where they split
-    -- especially on `endorse`, the decisive class -- mark the passage CONTESTED.
-  * ADJUDICATE: Claude resolves only the contested passages, BLIND to provider
-    identity (annotators shown as "Annotator A/B/..."). confidence=adjudicated.
-  * Fully automated; no human in the loop. Validity is anchored separately by the
-    codebook gold/adversarial suite, not a human audit.
+Design (codebook prompts live in python/codebook_prompts.py; grounded in Caplan,
+The Myth of the Rational Voter):
+
+  Level 1 - CIRCUIT.  All competitor LLMs label every passage with the LEAN prompt
+            (Caplan's verbatim definitions + decisive distinctions, ~200 wd/bias).
+            If the competitors are UNANIMOUS (same relevance and same stance on every
+            bias) the label is accepted -> confidence="high".
+  Level 2 - APPEALS.  Any passage with ANY disagreement (even one dissenting vote) is
+            re-labeled by ALL competitors again, this time with the FULL Caplan context
+            (definitions + his illustrations + his non-instances). If now unanimous ->
+            confidence="full_context_consensus".
+  Level 3 - SUPREME COURT.  Passages still split after the full-context re-vote go to
+            Claude (the adjudicator), with full Caplan context, for the final say. It
+            overrides ONLY the biases still contested, keeping consensus on the rest ->
+            confidence="adjudicated".
+
+Fully automated; no human in the loop. Validity is anchored by the codebook gold/
+adversarial suite (python/eval_gold.py), not a human audit.
 
 All four competitors are reached through the OpenAI-compatible API (OpenAI, Grok via
-api.x.ai, Gemini via its OpenAI-compatible endpoint, and the local Llama via Ollama).
-The adjudicator (Claude) uses the Anthropic SDK.
+api.x.ai, Gemini via its OpenAI-compatible endpoint, and local Llama via Ollama). The
+adjudicator (Claude) uses the Anthropic SDK with prompt caching on the system block.
 
 Keys are read from an ad-hoc keys file (default %CAPLAN_KEYS_FILE% or
 C:\\Users\\jdamm\\Caplan\\LLM\\Keys.env.txt) and never written anywhere.
 
-Stages (subcommands):
+Subcommands:
   preflight   one tiny call per provider to confirm keys + model names work
-  label       run each competitor over a queue.parquet -> labels_<name>.parquet
-  merge       combine competitor votes -> merged.parquet (+ contested flag)
-  adjudicate  Claude resolves contested rows -> final.parquet
-  run         label -> merge -> adjudicate, end to end
+  run         the full 3-level escalation, end to end (resumable) -> final.parquet
 """
 from __future__ import annotations
 import os, re, json, argparse
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
+
+from codebook_prompts import LEAN_SYSTEM, FULL_SYSTEM, ADJUDICATOR_SYSTEM
 
 BIASES = ["anti_market", "anti_foreign", "make_work", "pessimistic"]
 STANCES = ["endorse", "report", "quote", "reject"]
-
-# --- codebook prompt (keep in sync with docs/CODEBOOK.md §6) ---------------------
-SYSTEM_PROMPT = """You are a careful research annotator labeling historical U.S. newspaper passages (c. 1770-1964, possibly noisy OCR) for four economic biases. Apply the codebook exactly. Distinguish ENDORSEMENT of a biased view from neutral REPORTING, attributed QUOTATION, and explicit REJECTION. Never treat accurate reporting of real hardship as pessimistic bias, nor criticism of a specific fraud/monopoly as anti-market bias, nor merely mentioning immigration/trade as anti-foreign bias, nor reporting a layoff as make-work bias. Also: supporting trade restrictions/sanctions on GEOPOLITICAL, security, or moral grounds (e.g., embargoing a hostile power in wartime) is NOT anti-foreign bias -- anti-foreign bias is the ECONOMIC view that trade or dealing with foreigners is itself harmful.
-
-Return STRICT JSON only:
-{ "relevance": 0|1,
-  "labels": [ {"bias":"anti_market|anti_foreign|make_work|pessimistic",
-               "stance":"endorse|report|quote|reject",
-               "intensity":0|1|2|3} ],
-  "quality":"ok|ocr_noisy|unusable",
-  "rationale":"<=25 words" }
-
-relevance=1 iff the passage concerns markets/profit, foreigners/immigration/trade, labor-saving technology/jobs, or economic conditions/outlook. If relevance=0, labels=[]. A passage may have multiple labels. Only stance="endorse" marks a bias as present."""
-
-ADJUDICATOR_SYSTEM = """You are the senior adjudicator for a panel of annotators labeling historical U.S. newspaper passages (c. 1770-1964) for four economic biases, under a fixed codebook. The annotators disagreed. Decide the correct label yourself, applying the codebook exactly:
-- ENDORSEMENT of a bias is distinct from neutral REPORTING, attributed QUOTATION, and explicit REJECTION; only `endorse` counts as the bias being present.
-- Accurate reporting of real hardship is NOT pessimistic bias.
-- Criticism of a specific fraud/monopoly is NOT anti-market bias.
-- Merely mentioning immigration/trade is NOT anti-foreign bias.
-- Reporting a layoff is NOT make-work bias.
-- Supporting trade restrictions/sanctions on geopolitical, security, or moral grounds (e.g., embargoing a hostile power in wartime) is NOT anti-foreign bias; anti-foreign bias is the economic view that trade with foreigners is itself harmful.
-You are blind to which annotator said what; weigh the passage, not the labels. Return the SAME STRICT JSON schema the annotators used."""
 
 # --- keys ------------------------------------------------------------------------
 def load_keys(path: str | None = None) -> dict:
@@ -89,7 +75,7 @@ COMPETITORS = [
     Competitor("grok",   "https://api.x.ai/v1",                                "xai",    "grok-4.20-0309-non-reasoning"),
     Competitor("llama",  "http://localhost:11434/v1",                          None,     "llama3.1:8b"),
 ]
-ADJUDICATOR_MODEL = "claude-sonnet-4-6"
+ADJUDICATOR_MODEL = "claude-opus-4-7"   # Supreme Court: strongest model, full Caplan context
 
 # --- parsing ---------------------------------------------------------------------
 def parse_label(raw: str) -> dict:
@@ -118,17 +104,17 @@ def flatten(obj: dict) -> dict:
     return row
 
 # --- callers ---------------------------------------------------------------------
-def make_caller(comp: Competitor, keys: dict):
-    """Returns f(text)->parsed dict for one OpenAI-compatible competitor."""
+def make_caller(comp: Competitor, keys: dict, system_prompt: str):
+    """Returns f(text)->parsed dict for one OpenAI-compatible competitor.
+    The static `system_prompt` is the cacheable prefix (OpenAI/xAI auto-cache it)."""
     from openai import OpenAI
     api_key = (keys.get(comp.key_field) if comp.key_field else "ollama") or "none"
-    client = OpenAI(base_url=comp.base_url, api_key=api_key, timeout=60, max_retries=3)
-    user_tmpl = "PASSAGE:\n{}"
+    client = OpenAI(base_url=comp.base_url, api_key=api_key, timeout=90, max_retries=3)
 
     def call(text: str) -> dict:
-        kw = dict(model=comp.model, temperature=0, max_tokens=400,
-                  messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": user_tmpl.format((text or "")[:6000])}])
+        kw = dict(model=comp.model, temperature=0, max_tokens=500,
+                  messages=[{"role": "system", "content": system_prompt},
+                            {"role": "user", "content": "PASSAGE:\n" + (text or "")[:6000]}])
         try:
             r = client.chat.completions.create(response_format={"type": "json_object"}, **kw)
         except Exception:
@@ -140,25 +126,34 @@ def make_caller(comp: Competitor, keys: dict):
 def make_adjudicator(keys: dict, model: str = ADJUDICATOR_MODEL):
     import anthropic
     client = anthropic.Anthropic(api_key=keys["anthropic"])
+    # cache the long Caplan system block (90% cheaper on cache hits across the contested set)
+    system_blocks = [{"type": "text", "text": ADJUDICATOR_SYSTEM,
+                      "cache_control": {"type": "ephemeral"}}]
 
     def call(text: str, candidates: list[dict]) -> dict:
         lines = []
         for i, c in enumerate(candidates):
             tag = chr(ord("A") + i)
             stances = {b: c.get(f"{b}_stance") for b in BIASES}
-            lines.append(f"Annotator {tag}: relevance={c.get('relevance')} "
-                         f"stances={stances} rationale={c.get('rationale')!r}")
+            lines.append(f"Annotator {tag}: relevance={c.get('relevance')} stances={stances}")
         user = ("PASSAGE:\n" + (text or "")[:6000] +
-                "\n\nThe annotators proposed (identities hidden):\n" + "\n".join(lines) +
-                "\n\nDecide the correct label per the codebook. Return STRICT JSON only.")
-        msg = client.messages.create(model=model, max_tokens=400, temperature=0,
-                                     system=ADJUDICATOR_SYSTEM,
-                                     messages=[{"role": "user", "content": user}])
+                "\n\nThe annotators (identities hidden) saw full context and still disagreed:\n" +
+                "\n".join(lines) +
+                "\n\nDecide the correct label per Caplan's definitions. Return STRICT JSON only.")
+        # NB: Opus 4.7 (the Supreme Court) deprecates `temperature`; do not send it.
+        try:
+            msg = client.messages.create(model=model, max_tokens=600,
+                                         system=system_blocks,
+                                         messages=[{"role": "user", "content": user}])
+        except Exception:
+            msg = client.messages.create(model=model, max_tokens=600,
+                                         system=ADJUDICATOR_SYSTEM,
+                                         messages=[{"role": "user", "content": user}])
         return parse_label(msg.content[0].text)
 
     return call
 
-# --- stages ----------------------------------------------------------------------
+# --- preflight -------------------------------------------------------------------
 def cmd_preflight(args):
     keys = load_keys(args.keys)
     print("keys present:", {k: bool(v) for k, v in keys.items()})
@@ -166,30 +161,31 @@ def cmd_preflight(args):
               "trade itself breeds corruption.")
     for comp in COMPETITORS:
         try:
-            flat = flatten(make_caller(comp, keys)(sample))
+            flat = flatten(make_caller(comp, keys, LEAN_SYSTEM)(sample))
             print(f"  [ok]   {comp.name:7s} ({comp.model}) -> relevance={flat['relevance']} "
                   f"anti_market={flat['anti_market_stance']} parse_ok={flat['parse_ok']}")
         except Exception as e:
             print(f"  [FAIL] {comp.name:7s} ({comp.model}): {type(e).__name__}: {str(e)[:160]}")
     try:
         adj = make_adjudicator(keys, args.adjudicator)
-        cand = [flatten(parse_label('{"relevance":1,"labels":[{"bias":"anti_market","stance":"endorse","intensity":2}]}')),
-                flatten(parse_label('{"relevance":1,"labels":[{"bias":"anti_market","stance":"report","intensity":0}]}'))]
-        res = adj(sample, cand)
+        cand = [flatten(parse_label('{"relevance":1,"labels":[{"bias":"anti_market","stance":"endorse"}]}')),
+                flatten(parse_label('{"relevance":1,"labels":[{"bias":"anti_market","stance":"report"}]}'))]
+        res = flatten(adj(sample, cand))
         print(f"  [ok]   adjudicator ({args.adjudicator}) -> parse_ok={res.get('parse_ok')} "
-              f"anti_market={flatten(res)['anti_market_stance']}")
+              f"anti_market={res['anti_market_stance']}")
     except Exception as e:
         print(f"  [FAIL] adjudicator ({args.adjudicator}): {type(e).__name__}: {str(e)[:160]}")
 
-def _label_one_provider(comp, keys, df, id_col, text_col, out_path, workers):
+# --- one provider over a frame (resumable, checkpointed) -------------------------
+def _label_one_provider(comp, keys, df, id_col, text_col, out_path, workers, system_prompt):
     done = set()
     if os.path.exists(out_path):
         done = set(pd.read_parquet(out_path)[id_col].tolist())
     todo = df[~df[id_col].isin(done)]
     if len(todo) == 0:
-        print(f"  {comp.name}: nothing to do ({len(done)} done)")
+        print(f"    {comp.name}: nothing to do ({len(done)} done)")
         return
-    caller = make_caller(comp, keys)
+    caller = make_caller(comp, keys, system_prompt)
     rows = []
 
     def work(rec):
@@ -210,106 +206,163 @@ def _label_one_provider(comp, keys, df, id_col, text_col, out_path, workers):
                 ).drop_duplicates(subset=[id_col], keep="last")
                 combined.to_parquet(out_path, index=False)
                 rows = []
-                print(f"  {comp.name}: {i}/{len(recs)} labeled")
+                print(f"    {comp.name}: {i}/{len(recs)} labeled")
 
-def cmd_label(args):
+def _label_set(df, system_prompt, level_dir, args):
+    """Run every competitor over `df` with `system_prompt` -> level_dir/labels_<comp>.parquet."""
     keys = load_keys(args.keys)
-    df = pd.read_parquet(args.queue)
-    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(level_dir, exist_ok=True)
     only = set(args.providers.split(",")) if args.providers else None
     for comp in COMPETITORS:
         if only and comp.name not in only:
             continue
-        out = os.path.join(args.outdir, f"labels_{comp.name}.parquet")
-        print(f"[{comp.name}] -> {out}")
-        _label_one_provider(comp, keys, df, args.id_col, args.text_col, out, args.workers)
+        out = os.path.join(level_dir, f"labels_{comp.name}.parquet")
+        print(f"  [{os.path.basename(level_dir)} | {comp.name}] -> {out}")
+        _label_one_provider(comp, keys, df, args.id_col, args.text_col, out, args.workers, system_prompt)
 
-def _vote(stances: list[str | None]) -> tuple[str, bool]:
-    """Return (consensus_stance, contested). None => bias absent ('none')."""
-    vals = ["none" if s in (None, "", "nan") else s for s in stances]
-    n = len(vals)
-    endorse = sum(v == "endorse" for v in vals)
-    contested = (0 < endorse < n)                          # split on the decisive class
+# --- voting / merge --------------------------------------------------------------
+def _vote_unanimous(votes):
+    """Strict unanimity rule: ANY disagreement (even one dissenter) is contested.
+    Returns (consensus_value, contested). None/''/'nan' are treated as 'none'."""
+    vals = ["none" if v in (None, "", "nan") else v for v in votes]
     top = max(set(vals), key=vals.count)
-    if vals.count(top) < (0.75 * n):                       # no >=75% majority
-        contested = True
+    contested = len(set(vals)) > 1
     return top, contested
 
-def cmd_merge(args):
+def _merge_level(level_dir, args):
+    """Merge a level's competitor labels with the strict-unanimity rule.
+    Returns a DataFrame: id, relevance, relevance_contested, <bias>_stance,
+    <bias>_contested, contested, n_voters, votes_<comp>."""
     frames = {}
     for comp in COMPETITORS:
-        p = os.path.join(args.outdir, f"labels_{comp.name}.parquet")
+        p = os.path.join(level_dir, f"labels_{comp.name}.parquet")
         if os.path.exists(p):
             frames[comp.name] = pd.read_parquet(p).set_index(args.id_col)
     if not frames:
-        raise SystemExit("no labels_*.parquet found; run `label` first")
+        raise SystemExit(f"no labels_*.parquet found in {level_dir}")
     ids = sorted(set().union(*[set(f.index) for f in frames.values()]))
     out = []
     for _id in ids:
         cands = {nm: (f.loc[_id].to_dict() if _id in f.index else {}) for nm, f in frames.items()}
-        rel_votes = [c.get("relevance") for c in cands.values()]
-        rel_top, rel_contested = _vote([str(int(v)) if v in (0, 1) else None for v in rel_votes])
-        row = {args.id_col: _id, "relevance": int(rel_top) if rel_top in ("0", "1") else None,
-               "n_voters": len(cands)}
-        contested = rel_contested
-        row["relevance_contested"] = rel_contested
+        rel_top, rel_c = _vote_unanimous([c.get("relevance") for c in cands.values()])
+        row = {args.id_col: _id, "n_voters": len(cands),
+               "relevance": (None if rel_top == "none" else int(rel_top)),
+               "relevance_contested": rel_c}
+        contested = rel_c
         for b in BIASES:
-            stance, c = _vote([cands[nm].get(f"{b}_stance") for nm in cands])
-            row[f"{b}_stance"] = stance
+            stance, c = _vote_unanimous([cands[nm].get(f"{b}_stance") for nm in cands])
+            row[f"{b}_stance"] = (None if stance == "none" else stance)
             row[f"{b}_contested"] = c
             contested = contested or c
         row["contested"] = contested
-        row["confidence"] = "adjudicated" if contested else "high"
         for nm in frames:
-            row[f"votes_{nm}"] = json.dumps({b: cands[nm].get(f"{b}_stance") for b in BIASES})
+            row[f"votes_{nm}"] = json.dumps(
+                {"relevance": cands[nm].get("relevance"),
+                 **{b: cands[nm].get(f"{b}_stance") for b in BIASES}})
         out.append(row)
-    merged = pd.DataFrame(out)
-    os.makedirs(args.outdir, exist_ok=True)
-    merged.to_parquet(os.path.join(args.outdir, "merged.parquet"), index=False)
-    print(f"merged {len(merged)} passages; contested={int(merged['contested'].sum())} "
-          f"({100*merged['contested'].mean():.1f}%)")
+    return pd.DataFrame(out)
 
-def cmd_adjudicate(args):
-    keys = load_keys(args.keys)
-    merged = pd.read_parquet(os.path.join(args.outdir, "merged.parquet"))
-    queue = pd.read_parquet(args.queue).set_index(args.id_col)
-    adj = make_adjudicator(keys, args.adjudicator)
-    final = merged.copy()
-    contested = merged[merged["contested"]]
-    print(f"adjudicating {len(contested)} contested passages with {args.adjudicator}")
-    for pos, (_, r) in enumerate(contested.iterrows(), 1):
-        _id = r[args.id_col]
-        text = queue.loc[_id, args.text_col] if _id in queue.index else ""
-        cands = [json.loads(r[f"votes_{c.name}"]) | {"relevance": r["relevance"]}
-                 for c in COMPETITORS if f"votes_{c.name}" in r and pd.notna(r[f"votes_{c.name}"])]
-        cands = [{**{f"{b}_stance": d.get(b) for b in BIASES}, "relevance": d.get("relevance")} for d in cands]
-        try:
-            res = flatten(adj(text, cands))
-        except Exception as e:
-            print(f"  [warn] {_id}: {type(e).__name__}: {str(e)[:120]}")
-            continue
-        idx = final.index[final[args.id_col] == _id]
-        # Override ONLY the biases that were actually contested; keep the competitor
-        # consensus for the rest so adjudication can't clobber agreed-on labels.
-        if bool(r.get("relevance_contested", True)):
-            final.loc[idx, "relevance"] = res.get("relevance")
-        for b in BIASES:
-            if bool(r.get(f"{b}_contested", False)):
-                final.loc[idx, f"{b}_stance"] = res.get(f"{b}_stance")
-        if pos % 25 == 0:
-            print(f"  adjudicated {pos}/{len(contested)}")
-    final.to_parquet(os.path.join(args.outdir, "final.parquet"), index=False)
-    print(f"wrote final.parquet ({len(final)} passages)")
-
+# --- the 3-level run -------------------------------------------------------------
 def cmd_run(args):
-    cmd_label(args); cmd_merge(args); cmd_adjudicate(args)
+    os.makedirs(args.outdir, exist_ok=True)
+    queue = pd.read_parquet(args.queue)
+    qx = queue.set_index(args.id_col)
+    keys = load_keys(args.keys)
+
+    # ---------- Level 1: CIRCUIT (lean prompt, whole queue) ----------
+    print(f"=== LEVEL 1 (circuit): {len(queue)} passages, lean prompt ===")
+    _label_set(queue, LEAN_SYSTEM, os.path.join(args.outdir, "L1"), args)
+    m1 = _merge_level(os.path.join(args.outdir, "L1"), args)
+    m1.to_parquet(os.path.join(args.outdir, "merged_L1.parquet"), index=False)
+    esc1 = m1[m1["contested"]][args.id_col].tolist()
+    print(f"  L1 unanimous: {len(m1) - len(esc1)}/{len(m1)} ; escalating {len(esc1)} to Level 2")
+
+    # ---------- Level 2: APPEALS (full context, only L1-contested) ----------
+    m2 = None
+    if esc1:
+        print(f"=== LEVEL 2 (appeals): {len(esc1)} passages, FULL Caplan context ===")
+        sub = queue[queue[args.id_col].isin(esc1)]
+        _label_set(sub, FULL_SYSTEM, os.path.join(args.outdir, "L2"), args)
+        m2 = _merge_level(os.path.join(args.outdir, "L2"), args)
+        m2.to_parquet(os.path.join(args.outdir, "merged_L2.parquet"), index=False)
+        esc2 = m2[m2["contested"]][args.id_col].tolist()
+        print(f"  L2 unanimous: {len(m2) - len(esc2)}/{len(m2)} ; escalating {len(esc2)} to Level 3")
+    else:
+        esc2 = []
+
+    # ---------- assemble final, overlaying L2 on the escalated ids ----------
+    cols = (["relevance", "relevance_contested", "contested"] +
+            [f"{b}_stance" for b in BIASES] + [f"{b}_contested" for b in BIASES] +
+            [f"votes_{c.name}" for c in COMPETITORS])
+    final = m1.set_index(args.id_col).copy()
+    final["confidence"] = final["contested"].map(lambda c: "escalated" if c else "high")
+    if m2 is not None and len(m2):
+        m2x = m2.set_index(args.id_col)
+        for _id in m2x.index:
+            for col in cols:
+                if col in m2x.columns:
+                    final.at[_id, col] = m2x.at[_id, col]
+            final.at[_id, "confidence"] = ("adjudicated" if bool(m2x.at[_id, "contested"])
+                                           else "full_context_consensus")
+
+        # ---------- Level 3: SUPREME COURT (Opus 4.7, full context) ----------
+        if esc2:
+            print(f"=== LEVEL 3 (supreme court): adjudicating {len(esc2)} with {args.adjudicator} ===")
+            contested2 = m2x[m2x["contested"]]
+            adj_path = os.path.join(args.outdir, "adjudicated_L3.parquet")  # resumable checkpoint
+            done = set()
+            if os.path.exists(adj_path):
+                done = set(pd.read_parquet(adj_path)[args.id_col].tolist())
+            todo = [(i, r) for i, r in contested2.iterrows() if i not in done]
+            print(f"  L3: {len(done)} already adjudicated, {len(todo)} to do")
+            adj = make_adjudicator(keys, args.adjudicator)
+            buf = []
+            for pos, (_id, r) in enumerate(todo, 1):
+                text = qx.at[_id, args.text_col] if _id in qx.index else ""
+                cands = []
+                for c in COMPETITORS:
+                    col = f"votes_{c.name}"
+                    if col in r and pd.notna(r[col]):
+                        d = json.loads(r[col])
+                        cands.append({**{f"{b}_stance": d.get(b) for b in BIASES},
+                                      "relevance": d.get("relevance")})
+                try:
+                    res = flatten(adj(text, cands))
+                except Exception as e:
+                    print(f"  [warn] {_id}: {type(e).__name__}: {str(e)[:120]}")
+                    continue
+                buf.append({args.id_col: _id, "relevance": res.get("relevance"),
+                            **{f"{b}_stance": res.get(f"{b}_stance") for b in BIASES}})
+                if pos % 25 == 0 or pos == len(todo):
+                    adf = pd.concat(([pd.read_parquet(adj_path)] if os.path.exists(adj_path) else []) +
+                                    [pd.DataFrame(buf)], ignore_index=True
+                                    ).drop_duplicates(subset=[args.id_col], keep="last")
+                    adf.to_parquet(adj_path, index=False)
+                    buf = []
+                    print(f"    adjudicated {len(done) + pos}/{len(contested2)}")
+            # apply all adjudications (this run + prior) to final, scoped to contested biases only
+            if os.path.exists(adj_path):
+                adf = pd.read_parquet(adj_path).set_index(args.id_col)
+                for _id, r in contested2.iterrows():
+                    if _id not in adf.index:
+                        continue
+                    a = adf.loc[_id]
+                    if bool(r.get("relevance_contested", False)):
+                        final.at[_id, "relevance"] = a["relevance"]
+                    for b in BIASES:
+                        if bool(r.get(f"{b}_contested", False)):
+                            final.at[_id, f"{b}_stance"] = a[f"{b}_stance"]
+
+    final = final.reset_index()
+    final.to_parquet(os.path.join(args.outdir, "final.parquet"), index=False)
+    vc = final["confidence"].value_counts().to_dict()
+    print(f"wrote final.parquet ({len(final)} passages) | confidence: {vc}")
 
 # --- CLI -------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    common = dict()
-    for name in ("preflight", "label", "merge", "adjudicate", "run"):
+    for name in ("preflight", "run"):
         p = sub.add_parser(name)
         p.add_argument("--keys", default=None, help="keys file (default CAPLAN_KEYS_FILE)")
         p.add_argument("--queue", default="queue.parquet")
@@ -320,8 +373,7 @@ def main():
         p.add_argument("--workers", type=int, default=4)
         p.add_argument("--adjudicator", default=ADJUDICATOR_MODEL)
     args = ap.parse_args()
-    {"preflight": cmd_preflight, "label": cmd_label, "merge": cmd_merge,
-     "adjudicate": cmd_adjudicate, "run": cmd_run}[args.cmd](args)
+    {"preflight": cmd_preflight, "run": cmd_run}[args.cmd](args)
 
 if __name__ == "__main__":
     main()
