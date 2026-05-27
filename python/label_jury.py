@@ -36,7 +36,7 @@ BIASES = ["anti_market", "anti_foreign", "make_work", "pessimistic"]
 STANCES = ["endorse", "report", "quote", "reject"]
 
 # --- codebook prompt (keep in sync with docs/CODEBOOK.md §6) ---------------------
-SYSTEM_PROMPT = """You are a careful research annotator labeling historical U.S. newspaper passages (c. 1900-1945, possibly noisy OCR) for four economic biases. Apply the codebook exactly. Distinguish ENDORSEMENT of a biased view from neutral REPORTING, attributed QUOTATION, and explicit REJECTION. Never treat accurate reporting of real hardship as pessimistic bias, nor criticism of a specific fraud/monopoly as anti-market bias, nor merely mentioning immigration/trade as anti-foreign bias, nor reporting a layoff as make-work bias.
+SYSTEM_PROMPT = """You are a careful research annotator labeling historical U.S. newspaper passages (c. 1770-1964, possibly noisy OCR) for four economic biases. Apply the codebook exactly. Distinguish ENDORSEMENT of a biased view from neutral REPORTING, attributed QUOTATION, and explicit REJECTION. Never treat accurate reporting of real hardship as pessimistic bias, nor criticism of a specific fraud/monopoly as anti-market bias, nor merely mentioning immigration/trade as anti-foreign bias, nor reporting a layoff as make-work bias. Also: supporting trade restrictions/sanctions on GEOPOLITICAL, security, or moral grounds (e.g., embargoing a hostile power in wartime) is NOT anti-foreign bias -- anti-foreign bias is the ECONOMIC view that trade or dealing with foreigners is itself harmful.
 
 Return STRICT JSON only:
 { "relevance": 0|1,
@@ -48,12 +48,13 @@ Return STRICT JSON only:
 
 relevance=1 iff the passage concerns markets/profit, foreigners/immigration/trade, labor-saving technology/jobs, or economic conditions/outlook. If relevance=0, labels=[]. A passage may have multiple labels. Only stance="endorse" marks a bias as present."""
 
-ADJUDICATOR_SYSTEM = """You are the senior adjudicator for a panel of annotators labeling historical U.S. newspaper passages (c. 1900-1945) for four economic biases, under a fixed codebook. The annotators disagreed. Decide the correct label yourself, applying the codebook exactly:
+ADJUDICATOR_SYSTEM = """You are the senior adjudicator for a panel of annotators labeling historical U.S. newspaper passages (c. 1770-1964) for four economic biases, under a fixed codebook. The annotators disagreed. Decide the correct label yourself, applying the codebook exactly:
 - ENDORSEMENT of a bias is distinct from neutral REPORTING, attributed QUOTATION, and explicit REJECTION; only `endorse` counts as the bias being present.
 - Accurate reporting of real hardship is NOT pessimistic bias.
 - Criticism of a specific fraud/monopoly is NOT anti-market bias.
 - Merely mentioning immigration/trade is NOT anti-foreign bias.
 - Reporting a layoff is NOT make-work bias.
+- Supporting trade restrictions/sanctions on geopolitical, security, or moral grounds (e.g., embargoing a hostile power in wartime) is NOT anti-foreign bias; anti-foreign bias is the economic view that trade with foreigners is itself harmful.
 You are blind to which annotator said what; weigh the passage, not the labels. Return the SAME STRICT JSON schema the annotators used."""
 
 # --- keys ------------------------------------------------------------------------

@@ -74,9 +74,12 @@ base_dt <- merge(base_dt, reg, by = "lccn", all.x = TRUE)
 base_dt[is.na(region), region := "Unknown"]
 base_dt[, decade := (year %/% 10L) * 10L]
 strata  <- base_dt[, .(n = .N), by = .(decade, region)]
-strata[, take := pmax(1L, round(N_BASE * n / sum(n)))]
-base_sel <- base_dt[, .SD[sample(.N, min(.N, strata[.(decade[1], region[1]),
-                            on = .(decade, region), take]))], by = .(decade, region)]
+strata[, take := pmax(1L, as.integer(round(N_BASE * n / sum(n))))]
+# Merge the per-stratum quota onto each row, then sample within group. (The prior nested
+# cross-table lookup `strata[.(decade[1],region[1]), ...]` mis-scoped inside by= and collapsed
+# the base to ~one row per stratum -> only 77 total.)
+base_dt <- merge(base_dt, strata[, .(decade, region, take)], by = c("decade", "region"), all.x = TRUE)
+base_sel <- base_dt[, .SD[sample(.N, min(.N, take[1]))], by = .(decade, region)]
 base_sel[, sample_reason := "base_stratified"]
 
 pos_parts <- list()
